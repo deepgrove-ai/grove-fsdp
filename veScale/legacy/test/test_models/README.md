@@ -1,1 +1,0 @@
-The directory mainly stores the models and variables which are frequently used in various testing.
