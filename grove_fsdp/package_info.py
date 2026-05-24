@@ -12,16 +12,16 @@ VERSION = (MAJOR, MINOR, PATCH, PRE_RELEASE)
 __shortversion__ = '.'.join(map(str, VERSION[:3]))
 __version__ = '.'.join(map(str, VERSION[:3])) + ''.join(VERSION[3:])
 
-__package_name__ = 'grove_fsdp'
-__contact_names__ = 'Grove-FSDP maintainers'
-__contact_emails__ = ''
-__homepage__ = ''
-__repository_url__ = ''
-__download_url__ = ''
+__package_name__ = 'megatron_fsdp'
+__contact_names__ = 'NVIDIA'
+__contact_emails__ = 'nemo-toolkit@nvidia.com'  # use NeMo Email
+__homepage__ = 'https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/index.html'
+__repository_url__ = 'https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core'
+__download_url__ = 'https://github.com/NVIDIA/Megatron-LM/releases'
 __description__ = (
-    'Grove-FSDP: a standalone PyTorch FSDP package with zero-copy buffers and RaggedShard planning'
+    'Megatron Core - a library for efficient and scalable training of transformer based models'
 )
-__license__ = 'Apache-2.0'
+__license__ = 'BSD-3'
 __keywords__ = (
-    'deep learning, distributed training, fsdp, ragged shard, pytorch, torch'
+    'deep learning, machine learning, gpu, NLP, NLU, language, transformer, nvidia, pytorch, torch'
 )

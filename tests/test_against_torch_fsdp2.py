@@ -83,16 +83,12 @@ def _run_grove_vs_torch_fsdp2(rank: int, world_size: int, init_file: str) -> Non
 
         torch.manual_seed(1234)
         grove_model = TinyMLP().to(device)
-        grove_mesh = init_device_mesh(
-            "cuda",
-            (world_size, 1),
-            mesh_dim_names=("fsdp", "tp"),
-        )
+        grove_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("fsdp",))
         grove_model = fully_shard_model(
             grove_model,
             device_mesh=grove_mesh,
             dp_shard_dim="fsdp",
-            tp_dim="tp",
+            tp_dim=None,
             zero_dp_strategy="optim_grads_params",
             fsdp_unit_modules=[TinyMLP],
             device=device,

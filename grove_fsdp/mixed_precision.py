@@ -32,7 +32,7 @@ try:
 except (ImportError, ModuleNotFoundError):
     TransformerEngineBaseModule = None
     HAVE_TE = False
-    logger.info("Using Grove-FSDP without Transformer Engine.")
+    logger.info("Using Megatron-FSDP without Transformer Engine.")
 
 # Detect the Transformer Engine version
 try:
@@ -98,56 +98,18 @@ try:
 except:
     HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8 = False
 
-    # Try to import multi_tensor_apply, used in the fallback of fp8 quantization.
-    try:
-        from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
-
-        multi_tensor_scale_impl = multi_tensor_scale
-    except ImportError:
-        try:
-            import amp_C
-            from apex.multi_tensor_apply import multi_tensor_applier
-
-            multi_tensor_scale_impl = amp_C.multi_tensor_scale
-        except ImportError:
-            import warnings
-
-            warnings.warn(
-                "Transformer Engine and Apex are not installed. "
-                "Falling back to local implementations of "
-                "multi_tensor_applier and multi_tensor_scale"
-            )
-
-            def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
-                """Multi tensor op applier"""
-                return op(2048 * 32, noop_flag_buffer, tensor_lists, *args)
-
-            def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
-                """Works as a drop-in replacement for amp_C.multi_tensor_scale."""
-                for src, dst in zip(tensor_lists[0], tensor_lists[1]):
-                    dst.copy_(src * scale)
-
-            multi_tensor_applier = local_multi_tensor_applier
-            multi_tensor_scale_impl = local_multi_tensor_scale
-
     def _multi_tensor_copy_this_to_that(
         this: List[torch.Tensor],
         that: List[torch.Tensor],
         overflow_buf: Optional[torch.Tensor] = None,
     ):
         """
-        Use multi-tensor-applier to copy values from one list to another.
-        We don't have a bfloat16 implementation so for now if the overflow_buf
-        is not provided, we default back to simple loop copy to be compatible
-        with bfloat16.
+        Use PyTorch's local foreach kernels to copy values from one list to another.
         """
         if overflow_buf is not None:
             overflow_buf.fill_(0)
-            # Scaling with factor `1.0` is equivalent to copy.
-            multi_tensor_applier(multi_tensor_scale_impl, overflow_buf, [this, that], 1.0)
-        else:
-            for this_, that_ in zip(this, that):
-                that_.copy_(this_)
+
+        torch._foreach_copy_(that, this)
 
 
 # Detect the "post_all_gather_processing" function of Transformer Engine
@@ -377,18 +339,18 @@ def get_quantized_model_init_context_cls():
 
 @dataclass(frozen=True)
 class MixedPrecisionPolicy:
-    """Grove-FSDP Mixed Precision Dataclass"""
+    """Megatron-FSDP Mixed Precision Dataclass"""
 
     main_params_dtype: Optional[torch.dtype] = torch.float32
     """Data type for the main weight buffer utilized for distributed optimization
-      and quantization with Grove-FSDP. If set to None, the model compute weight
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
       buffer will take the role of the main weights, or when no sharding is applied,
       the native model weights become the main weights. Defaults to torch.float32.
     """
 
     main_grads_dtype: Optional[torch.dtype] = None
     """Data type for the main gradient buffer utilized for distributed optimization with
-      Grove-FSDP. If set to None, main gradients will match the dtype of the model
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
       compute parameters specified by the user model. Defaults to None.
     """
 

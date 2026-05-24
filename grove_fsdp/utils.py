@@ -105,18 +105,18 @@ def is_submodule(module, parent_module, strict=True):
     return False
 
 
-def find_grove_fsdp(model):
-    """Walk the model wrapper chain to find a GroveFSDP instance, if any."""
-    # Lazy import to avoid a circular import: grove_fsdp.py transitively imports
+def find_megatron_fsdp(model):
+    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+    # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
     # this module during its own initialization, so a top-level import of
-    # GroveFSDP here would fail with a partially-initialized module error.
+    # MegatronFSDP here would fail with a partially-initialized module error.
     try:
-        from .grove_fsdp import GroveFSDP
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
     except (ImportError, ModuleNotFoundError):
         return None
     m = model
     while m is not None:
-        if isinstance(m, GroveFSDP):
+        if isinstance(m, MegatronFSDP):
             return m
         m = getattr(m, 'module', None)
     return None
@@ -488,7 +488,7 @@ def log_single_rank(logger_: logging.Logger, level: int, msg: str, *args, rank: 
 # Needs more visibility and is easily refactored / standalone.
 class FSDPDistributedIndex:
     """
-    Class containing references to the process groups utilized by Grove-FSDP.
+    Class containing references to the process groups utilized by Megatron-FSDP.
 
     This class tracks the device mesh and different process groups required
     for full-sharded data parallelism (FSDP), including support for hybrid
@@ -554,7 +554,7 @@ class FSDPDistributedIndex:
             if contains_submesh(self.device_mesh, self.dp_shard_dim)
             else None
         )
-        # AG groups: supplied via ProcessGroupCollection (Grove-FSDP entrypoint).
+        # AG groups: supplied via ProcessGroupCollection (Megatron-FSDP entrypoint).
         self.fsdp_group_ag = fsdp_group_ag
         self.expt_fsdp_group_ag = expt_fsdp_group_ag
         # Retrieve the outer-FSDP process group from the DeviceMesh.
@@ -584,13 +584,13 @@ class FSDPDistributedIndex:
         )
 
         """
-        Grove-FSDP is responsible for storing all required DeviceMesh
+        Megatron-FSDP is responsible for storing all required DeviceMesh
         as per best practices recommended by the DeviceMesh API.
 
         NOTE(@cspades): In PyTorch 2.11, retrieving flattened mesh dimensions
         will be impossible via the device_mesh[...] API. We will require all
         users to correctly _unflatten() their DeviceMesh such that all
-        dimensions used by Grove-FSDP are sub-meshes of the DeviceMesh.
+        dimensions used by Megatron-FSDP are sub-meshes of the DeviceMesh.
         contains_submesh(...) -> get_mesh_names(only_submesh_dims=True).
         """
         self.mesh_library = {}
@@ -629,7 +629,7 @@ class FSDPDistributedIndex:
         # Validate FSDP arguments.
         if self.fsdp_group is None:
             raise ValueError(
-                "Grove-FSDP (FSDPDistributedIndex) requires an FSDP process group "
+                "Megatron-FSDP (FSDPDistributedIndex) requires an FSDP process group "
                 "(dp_shard_dim, fsdp_group) for core functionality."
             )
 
@@ -653,7 +653,7 @@ class FSDPDistributedIndex:
         self, mesh_dim_names: str | Sequence[str], is_expert_parallel: bool = False
     ) -> DeviceMesh:
         """
-        Retrieve an Grove-FSDP-registered submesh by name(s).
+        Retrieve an Megatron-FSDP-registered submesh by name(s).
         """
         if isinstance(mesh_dim_names, str) or mesh_dim_names is None:
             # Create tuple from singleton dim or None.
@@ -672,7 +672,7 @@ class FSDPDistributedIndex:
                 logger.warning(
                     "[FSDPDistributedIndex] For TransformerEngine, or other "
                     "machine learning frameworks like Megatron that assume "
-                    "TP=1, you must specify tp_dim to use Grove-FSDP. "
+                    "TP=1, you must specify tp_dim to use Megatron-FSDP. "
                     "Create a trivial TP dimension by setting the TP dimension "
                     "size to 1 in the DeviceMesh.\n"
                     f"{'Expert ' if is_expert_parallel else ''}DeviceMesh: {device_mesh}"
@@ -680,7 +680,7 @@ class FSDPDistributedIndex:
             raise ValueError(
                 f"[FSDPDistributedIndex][get_submesh] No submesh with "
                 f"mesh_dim_names={mesh_dim_names}, is_expert_parallel={is_expert_parallel} "
-                f"has been registered with Grove-FSDP.\n"
+                f"has been registered with Megatron-FSDP.\n"
                 f"{'Expert ' if is_expert_parallel else ''}DeviceMesh: {device_mesh}"
             )
 
@@ -777,14 +777,7 @@ class GlobalMemoryBuffer:
     def __init__(self):
         self.buffer = {}
 
-    def get_tensor(
-        self,
-        tensor_shape,
-        dtype,
-        name,
-        mem_alloc_context: Optional[Callable] = None,
-        device=None,
-    ):
+    def get_tensor(self, tensor_shape, dtype, name, mem_alloc_context: Optional[Callable] = None):
         """
         Returns (potentially) a sub-tensor from the self.buffer for the given shape.
         """
@@ -795,20 +788,14 @@ class GlobalMemoryBuffer:
         ):
             mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
             with mem_alloc_context():
-                if device is None:
-                    device = torch.cuda.current_device()
                 self.buffer[(name, dtype)] = torch.empty(
                     required_len,
                     dtype=dtype,
-                    device=device,
+                    device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
-
-    def clear(self):
-        """Drop all cached global-memory tensors."""
-        self.buffer.clear()
 
 
 def get_global_memory_buffer():
@@ -877,5 +864,7 @@ def using_tensor_parallel(dist_index, is_expert_parallel: bool = False) -> bool:
     """
     Check if tensor parallelism is being used based on the distributed index.
     """
+    if dist_index.tp_dim is None:
+        return False
     tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_parallel)
     return tp_mesh.mesh.numel() > 1

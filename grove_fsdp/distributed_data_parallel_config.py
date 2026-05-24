@@ -11,7 +11,7 @@ from .utils import is_torch_min_version
 @dataclass
 class DistributedDataParallelConfig:
     """
-    Grove-FSDP `fully_shard` API sub-configuration
+    Megatron-FSDP `fully_shard` API sub-configuration
     derived from Megatron-Core DistributedDataParallel.
     """
 
@@ -56,7 +56,7 @@ class DistributedDataParallelConfig:
       based on your system's memory and performance requirements."""
 
     keep_fp8_transpose_cache: bool = False
-    """If true, keep the fp8 transpose cache when using Grove FSDP."""
+    """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
     nccl_ub: bool = False
     """If true, allocate and register NCCL userbuffer for param and grad buffer.
@@ -77,15 +77,15 @@ class DistributedDataParallelConfig:
 
     fsdp_double_buffer: bool = False
     """If true, use persistently allocated double buffers for the 
-      temporary memory needed in the Grove FSDP communications.
+      temporary memory needed in the Megatron FSDP communications.
       This option will cause additional memory overhead, however, it is necessary for
-      to register user buffer (nccl_ub=True) for the Grove FSDP. 
+      to register user buffer (nccl_ub=True) for the Megatron FSDP. 
       This option will be automatically set to True when nccl_ub=True.
     """
 
     fsdp_all_gather_in_start_param_sync: bool = True
     """
-    If True, use all-gather during the initial Grove-FSDP parameter
+    If True, use all-gather during the initial Megatron-FSDP parameter
     synchronization step. This can increase overlap between the first
     parameter all-gather and computation, helping to better hide the
     initial communication cost.
@@ -114,26 +114,26 @@ class DistributedDataParallelConfig:
 
     fsdp_manual_registration: bool = False
     """If true, manually register the FSDP communication buffers to NCCL user buffer.
-      This option is only effective when use_grove_fsdp and nccl_ub is set.
+      This option is only effective when use_megatron_fsdp and nccl_ub is set.
       For symmetric registration with large models, the registration itself can take 
       a significant amount of time. This option minimizes the number of registration calls
       to minimize the registration time.
     """
 
-    grove_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
+    megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
     """Data type for the main weight buffer utilized for distributed optimization
-      and quantization with Grove-FSDP. If set to None, the model compute weight
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
       buffer will take the role of the main weights, or when no sharding is applied,
       the native model weights become the main weights. Defaults to torch.float32.
     """
 
-    grove_fsdp_main_grads_dtype: Optional[torch.dtype] = None
+    megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
     """Data type for the main gradient buffer utilized for distributed optimization with
-      Grove-FSDP. If set to None, main gradients will match the dtype of the model
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
       compute parameters specified by the user model. Defaults to None.
     """
 
-    grove_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
+    megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
     """Data type for gradient gather / scatter communications. Can be utilized to reduce
       communication latency, but adds overhead for type-casting and copy operations.
       If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
@@ -147,14 +147,14 @@ class DistributedDataParallelConfig:
       No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
     """
 
-    grove_fsdp_use_decoupled_grad: bool = False
-    """If true, Grove-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
+    megatron_fsdp_use_decoupled_grad: bool = False
+    """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
       gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting
       main gradients to parameter dtype for `.grad`.
     """
 
-    grove_fsdp_enable_fine_grained_param_gather: bool = False
-    """If set to True, enables fine-grained parameter gathering for Grove-FSDP.
+    megatron_fsdp_enable_fine_grained_param_gather: bool = False
+    """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
       This feature increases the overlap between parameter all-gather and forward computation,
       at the cost of more frequent communication calls.
       For MXFP8, this approach helps save memory during fine-grained activation
@@ -164,51 +164,34 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
-    grove_fsdp_enable_ragged_shard_planning: bool = True
-    """If true, use the RaggedShard-compatible DBuffer planner for FSDP bucket layouts.
-      The current implementation keeps RaggedShard as metadata and still communicates
-      flat bucket tensors, preserving existing all-gather and reduce-scatter paths.
-    """
-
     grove_fsdp_ragged_shard_block_size: Optional[int] = None
     """Optional contiguous element block size for RaggedShard layout planning.
-      When unset, Grove-FSDP defaults to row-wise blocks for tensors with rank
-      greater than one, and element-wise blocks for rank-zero/rank-one tensors.
+      When unset, Grove-FSDP defaults to element-wise blocks.
       This option is ignored when `grove_fsdp_ragged_shard_block_size_fn` is set.
     """
 
     grove_fsdp_ragged_shard_block_size_fn: Optional[Callable[[torch.Size], int]] = None
-    """Optional shape-aware block-size function for RaggedShard layout planning.
-      This should return the contiguous element block size for each tensor shape.
-      Use this for per-tensor quantization or layout constraints that cannot be
-      represented by one global `grove_fsdp_ragged_shard_block_size`.
-      This option is ignored when `grove_fsdp_ragged_shard_param_block_size_fn`
-      is set.
-    """
+    """Optional shape-aware block-size function for RaggedShard layout planning."""
 
     grove_fsdp_ragged_shard_param_block_size_fn: Optional[
         Callable[[torch.nn.Parameter], int]
     ] = None
-    """Optional per-parameter block-size function for RaggedShard layout planning.
-      This should return the contiguous element block size for each sharded
-      parameter. Use this when tensors with the same shape can still have
-      different block constraints.
-    """
+    """Optional per-parameter block-size function for RaggedShard layout planning."""
 
     grove_fsdp_align_dbuffer_to_chunk_size: bool = False
-    """If true, require DBuffer per-rank shard sizes to align to the existing
-      communication chunk-size factor. The default keeps chunking separate from
-      RaggedShard layout planning to reduce row-wise padding overhead.
-    """
+    """If true, require per-rank DBuffer shard sizes to align to chunk_size_factor."""
 
-    grove_fsdp_dbuffer_workspace_size: int = 0
-    """Initial target number of reusable full-bucket DBuffer workspaces for
-      temporary all-gather and reduce-scatter communication buffers when fixed-pool
-      double buffering is not otherwise enabled. The pool may grow if overlap or
-      prefetch produces higher live concurrency, so it is opt-in by default.
-      A value of 0 disables this workspace pool and falls back to storage-resize
-      allocation.
-    """
+    grove_fsdp_dbuffer_workspace_size: int = 2
+    """Initial target number of reusable full-bucket DBuffer workspaces."""
+
+    grove_fsdp_release_non_fsdp_unit_params: bool = True
+    """Release shallow non-FSDP-unit parameter buckets after use."""
+
+    grove_fsdp_coalesce_all_gather: bool = True
+    """Use torch.distributed's coalescing manager for bucket all-gathers."""
+
+    grove_fsdp_inplace_reduce_scatter: bool = True
+    """Reduce-scatter directly into persistent local gradient DBuffer shards when possible."""
 
     def __post_init__(self):
         import os

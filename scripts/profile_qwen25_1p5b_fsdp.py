@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import glob
 import json
 import os
 import time
@@ -40,6 +41,8 @@ class Result:
     tokens_per_s: float
     peak_allocated_gib: float
     peak_reserved_gib: float
+    step_cuda_ms: list[float]
+    step_enqueue_ms: list[float]
 
 
 @dataclass(frozen=True)
@@ -126,9 +129,45 @@ def parse_args() -> argparse.Namespace:
         help="Number of active timed steps to capture when --profile-dir is set.",
     )
     parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Log results, step times, and profiler traces to Weights & Biases from rank 0.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        default="placenta",
+        help="Weights & Biases entity for --wandb.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default="vescale",
+        help="Weights & Biases project for --wandb.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        default=None,
+        help="Optional Weights & Biases run name.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        default=None,
+        choices=("online", "offline", "disabled"),
+        help="Optional W&B mode override.",
+    )
+    parser.add_argument(
+        "--wandb-upload-all-ranks",
+        action="store_true",
+        help="Upload profiler traces from all ranks. By default only rank 0 traces are uploaded.",
+    )
+    parser.add_argument(
         "--grove-overlap",
         action="store_true",
-        help="Enable Grove overlap_grad_reduce and overlap_param_gather.",
+        help="Deprecated compatibility flag. Grove overlap is enabled by default.",
+    )
+    parser.add_argument(
+        "--no-grove-overlap",
+        action="store_true",
+        help="Disable Grove overlap_grad_reduce and overlap_param_gather.",
     )
     parser.add_argument(
         "--disable-bucketing",
@@ -143,10 +182,64 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--grove-dbuffer-workspace-size",
         type=int,
-        default=0,
-        help="Opt-in Grove DBuffer workspace pool size. 0 uses storage-resize allocation.",
+        default=2,
+        help=(
+            "Initial Grove DBuffer workspace pool size for reusable full-bucket "
+            "communication buffers. 0 uses storage-resize allocation."
+        ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--no-grove-release-non-fsdp-unit-params",
+        action="store_true",
+        help=(
+            "Disable releasing Grove-owned shallow parameters on non-FSDP-unit modules."
+        ),
+    )
+    parser.add_argument(
+        "--grove-release-non-fsdp-unit-params",
+        action="store_true",
+        help=(
+            "Deprecated compatibility flag. This optimization is enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-grove-coalesce-all-gather",
+        action="store_true",
+        help=(
+            "Disable torch.distributed coalesced all-gather for Grove parameter buckets."
+        ),
+    )
+    parser.add_argument(
+        "--no-grove-inplace-reduce-scatter",
+        action="store_true",
+        help=(
+            "Disable Grove's DBuffer in-place reduce-scatter path. The profiler "
+            "enables it by default because it zeros Grove grad buffers every step."
+        ),
+    )
+    parser.add_argument(
+        "--grove-nccl-registered-memory",
+        action="store_true",
+        help=(
+            "Enable NCCL registered user-buffer allocation for Grove without "
+            "requesting symmetric-memory registration."
+        ),
+    )
+    parser.add_argument(
+        "--grove-nccl-symmetric-memory",
+        action="store_true",
+        help=(
+            "Enable NCCL registered symmetric-memory buffers for Grove via the "
+            "Megatron-FSDP user-buffer path."
+        ),
+    )
+    args = parser.parse_args()
+    if args.grove_nccl_registered_memory and args.grove_nccl_symmetric_memory:
+        parser.error(
+            "--grove-nccl-registered-memory and --grove-nccl-symmetric-memory "
+            "are mutually exclusive."
+        )
+    return args
 
 
 def dtype_from_arg(name: str) -> torch.dtype:
@@ -194,7 +287,7 @@ def local_qwen25_1p5b_config(dtype: torch.dtype) -> Any:
     Qwen2Config, _, _ = get_qwen_classes()
     return Qwen2Config(
         vocab_size=151936,
-        hidden_size=1536,
+        hidden_size=2048,
         intermediate_size=8960,
         num_hidden_layers=28,
         num_attention_heads=12,
@@ -272,11 +365,10 @@ def apply_grove_fsdp(
     extra_kwargs = {}
     if args.grove_dbuffer_workspace_size != 0:
         extra_kwargs["grove_fsdp_dbuffer_workspace_size"] = args.grove_dbuffer_workspace_size
-    mesh = init_device_mesh(
-        "cuda",
-        (world_size, 1),
-        mesh_dim_names=("fsdp", "tp"),
+    use_nccl_registered_memory = (
+        args.grove_nccl_registered_memory or args.grove_nccl_symmetric_memory
     )
+    mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("fsdp",))
     mp_policy = MixedPrecisionPolicy(
         main_params_dtype=None,
         main_grads_dtype=dtype,
@@ -286,16 +378,21 @@ def apply_grove_fsdp(
         module=model,
         device_mesh=mesh,
         dp_shard_dim="fsdp",
-        tp_dim="tp",
+        tp_dim=None,
         zero_dp_strategy="optim_grads_params",
         fsdp_unit_modules=[Qwen2DecoderLayer],
         device=device,
         mixed_precision_policy=mp_policy,
-        overlap_grad_reduce=args.grove_overlap,
-        overlap_param_gather=args.grove_overlap,
+        overlap_grad_reduce=args.grove_overlap or not args.no_grove_overlap,
+        overlap_param_gather=args.grove_overlap or not args.no_grove_overlap,
         sync_model_each_microbatch=True,
         disable_bucketing=args.disable_bucketing,
         preproc_state_dict_for_dcp_ckpt=False,
+        nccl_ub=use_nccl_registered_memory,
+        disable_symmetric_registration=not args.grove_nccl_symmetric_memory,
+        grove_fsdp_release_non_fsdp_unit_params=not args.no_grove_release_non_fsdp_unit_params,
+        grove_fsdp_coalesce_all_gather=not args.no_grove_coalesce_all_gather,
+        grove_fsdp_inplace_reduce_scatter=not args.no_grove_inplace_reduce_scatter,
         **extra_kwargs,
     )
 
@@ -366,25 +463,33 @@ def synthetic_batch(
 
 def forward_backward(model: torch.nn.Module, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     model.zero_grad(set_to_none=True)
+    if hasattr(model, "zero_grad_buffer"):
+        model.zero_grad_buffer()
+    if hasattr(model, "start_param_sync"):
+        model.start_param_sync()
     loss = model(**batch).loss
     loss.backward()
     return loss.detach()
 
 
-def maybe_profile(profile_dir: str | None, backend: str, rank: int, active_steps: int):
+def backend_trace_dir(profile_dir: str, backend: str, rank: int) -> str:
+    return os.path.join(profile_dir, backend, f"rank{rank}")
+
+
+def maybe_profile(args: argparse.Namespace, backend: str, rank: int):
+    profile_dir = args.profile_dir
     if profile_dir is None:
         return nullcontext()
 
-    os.makedirs(profile_dir, exist_ok=True)
+    trace_dir = backend_trace_dir(profile_dir, backend, rank)
+    os.makedirs(trace_dir, exist_ok=True)
     return torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=active_steps, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            os.path.join(profile_dir, f"{backend}_rank{rank}")
-        ),
+        schedule=torch.profiler.schedule(wait=0, warmup=1, active=args.profile_steps, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir),
         record_shapes=False,
         profile_memory=True,
         with_stack=False,
@@ -395,6 +500,14 @@ def max_across_ranks(value: float, device: torch.device) -> float:
     tensor = torch.tensor([value], dtype=torch.float64, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
     return float(tensor.item())
+
+
+def max_list_across_ranks(values: list[float], device: torch.device) -> list[float]:
+    if not values:
+        return []
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return [float(value) for value in tensor.cpu().tolist()]
 
 
 def synchronize_backend(model: torch.nn.Module | None, device: torch.device) -> None:
@@ -429,6 +542,129 @@ def clear_global_memory_buffer() -> None:
         get_global_memory_buffer().clear()
     except Exception as exc:  # noqa: BLE001
         rank_print(f"[cleanup] global memory buffer clear skipped: {type(exc).__name__}: {exc}")
+
+
+def ensure_profile_dir(args: argparse.Namespace, rank: int) -> None:
+    if not args.wandb or args.profile_dir is not None:
+        return
+
+    profile_dir = (
+        os.path.join("profiles", f"qwen25_1p5b_{int(time.time())}") if rank == 0 else None
+    )
+    payload = [profile_dir]
+    dist.broadcast_object_list(payload, src=0)
+    args.profile_dir = payload[0]
+
+
+def validate_wandb_available(args: argparse.Namespace, device: torch.device) -> None:
+    if not args.wandb:
+        return
+
+    try:
+        import wandb
+        wandb_available = True
+    except ImportError:
+        wandb_available = False
+
+    available_tensor = torch.tensor([int(wandb_available)], dtype=torch.int32, device=device)
+    dist.all_reduce(available_tensor, op=dist.ReduceOp.MIN)
+    if int(available_tensor.item()) == 0:
+        raise RuntimeError(
+            "W&B logging requested with --wandb, but wandb is not installed."
+        )
+
+
+def init_wandb(args: argparse.Namespace, world_size: int):
+    if not args.wandb or not is_rank0():
+        return None
+
+    import wandb
+
+    settings = {}
+    if args.wandb_mode is not None:
+        settings["mode"] = args.wandb_mode
+
+    config = vars(args).copy()
+    config["world_size"] = world_size
+    config["torch_version"] = torch.__version__
+    return wandb.init(
+        entity=args.wandb_entity,
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        config=config,
+        **settings,
+    )
+
+
+def trace_files_for_upload(profile_dir: str, upload_all_ranks: bool) -> list[str]:
+    patterns = (
+        [os.path.join(profile_dir, "*", "rank*", "*")]
+        if upload_all_ranks
+        else [os.path.join(profile_dir, "*", "rank0", "*")]
+    )
+    files = []
+    for pattern in patterns:
+        files.extend(path for path in glob.glob(pattern) if os.path.isfile(path))
+    return sorted(files)
+
+
+def log_wandb_results(run: Any, args: argparse.Namespace, results: list[Result]) -> None:
+    if run is None or not is_rank0():
+        return
+
+    import wandb
+
+    rows = []
+    wandb_step = 0
+    for result in results:
+        result_dict = asdict(result)
+        step_cuda_ms = result_dict.pop("step_cuda_ms")
+        step_enqueue_ms = result_dict.pop("step_enqueue_ms")
+        run.log({f"{result.backend}/summary/{key}": value for key, value in result_dict.items()})
+        for step_idx, (cuda_ms, enqueue_ms) in enumerate(zip(step_cuda_ms, step_enqueue_ms)):
+            run.log(
+                {
+                    "backend": result.backend,
+                    f"{result.backend}/step_cuda_ms": cuda_ms,
+                    f"{result.backend}/step_enqueue_ms": enqueue_ms,
+                    f"{result.backend}/step": step_idx,
+                },
+                step=wandb_step,
+            )
+            wandb_step += 1
+            rows.append([result.backend, step_idx, cuda_ms, enqueue_ms])
+
+    if rows:
+        table = wandb.Table(
+            columns=["backend", "step", "cuda_ms", "enqueue_ms"],
+            data=rows,
+        )
+        run.log({"step_times": table})
+
+    if args.profile_dir is not None:
+        trace_files = trace_files_for_upload(
+            args.profile_dir,
+            upload_all_ranks=args.wandb_upload_all_ranks,
+        )
+        if trace_files:
+            artifact = wandb.Artifact(
+                name=f"qwen25-1p5b-{run.id}-torch-profiler-traces",
+                type="torch-profiler-trace",
+                metadata={
+                    "profile_dir": args.profile_dir,
+                    "upload_all_ranks": args.wandb_upload_all_ranks,
+                    "profile_steps": args.profile_steps,
+                },
+            )
+            for trace_file in trace_files:
+                artifact.add_file(
+                    trace_file,
+                    name=os.path.relpath(trace_file, args.profile_dir),
+                )
+            run.log_artifact(artifact)
+            run.log({"trace_file_count": len(trace_files)})
+        else:
+            rank_print(f"[wandb] no profiler trace files found under {args.profile_dir}")
 
 
 def profile_backend(
@@ -476,16 +712,34 @@ def profile_backend(
 
     rank_print(f"[{backend}] timing {args.steps} forward+backward iterations")
     torch.cuda.reset_peak_memory_stats(device)
-    with maybe_profile(args.profile_dir, backend, rank, args.profile_steps) as prof:
+    step_enqueue_ms = []
+    step_start_events = []
+    step_end_events = []
+    with maybe_profile(args, backend, rank) as prof:
         start = time.perf_counter()
-        for _ in range(args.steps):
-            forward_backward(model, batch)
+        for step_idx in range(args.steps):
+            step_start_event = torch.cuda.Event(enable_timing=True)
+            step_end_event = torch.cuda.Event(enable_timing=True)
+            step_start_events.append(step_start_event)
+            step_end_events.append(step_end_event)
+            step_enqueue_start = time.perf_counter()
+            step_start_event.record()
+            with torch.profiler.record_function(f"{backend}_forward_backward_step_{step_idx}"):
+                forward_backward(model, batch)
+            step_end_event.record()
+            step_enqueue_ms.append((time.perf_counter() - step_enqueue_start) * 1000.0)
             if prof is not None and hasattr(prof, "step"):
                 prof.step()
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - start
 
+    step_cuda_ms = [
+        start_event.elapsed_time(end_event)
+        for start_event, end_event in zip(step_start_events, step_end_events)
+    ]
     elapsed = max_across_ranks(elapsed, device)
+    step_cuda_ms = max_list_across_ranks(step_cuda_ms, device)
+    step_enqueue_ms = max_list_across_ranks(step_enqueue_ms, device)
     peak_allocated_gib = torch.cuda.max_memory_allocated(device) / 1024**3
     peak_reserved_gib = torch.cuda.max_memory_reserved(device) / 1024**3
     peak_allocated_gib = max_across_ranks(peak_allocated_gib, device)
@@ -504,6 +758,8 @@ def profile_backend(
         tokens_per_s=tokens_per_iter * args.steps / elapsed,
         peak_allocated_gib=peak_allocated_gib,
         peak_reserved_gib=peak_reserved_gib,
+        step_cuda_ms=step_cuda_ms,
+        step_enqueue_ms=step_enqueue_ms,
     )
 
     synchronize_backend(model, device)
@@ -522,7 +778,18 @@ def print_results(results: Iterable[Result]) -> None:
 
     print("\nSummary", flush=True)
     for result in rows:
-        print(json.dumps(asdict(result), sort_keys=True), flush=True)
+        result_dict = asdict(result)
+        result_dict["step_cuda_ms_mean"] = (
+            sum(result.step_cuda_ms) / len(result.step_cuda_ms) if result.step_cuda_ms else 0.0
+        )
+        result_dict["step_enqueue_ms_mean"] = (
+            sum(result.step_enqueue_ms) / len(result.step_enqueue_ms)
+            if result.step_enqueue_ms
+            else 0.0
+        )
+        result_dict.pop("step_cuda_ms")
+        result_dict.pop("step_enqueue_ms")
+        print(json.dumps(result_dict, sort_keys=True), flush=True)
 
     if len(rows) == 2:
         baseline, candidate = rows
@@ -541,7 +808,10 @@ def print_results(results: Iterable[Result]) -> None:
 def main() -> None:
     args = parse_args()
     rank, world_size, device = init_distributed(args.local_rank)
+    ensure_profile_dir(args, rank)
+    wandb_run = None
     try:
+        validate_wandb_available(args, device)
         backends = (
             ("grove", "torch-fsdp2")
             if args.backend == "both"
@@ -552,7 +822,12 @@ def main() -> None:
             for backend in backends
         ]
         print_results(results)
+        dist.barrier()
+        wandb_run = init_wandb(args, world_size)
+        log_wandb_results(wandb_run, args, results)
     finally:
+        if wandb_run is not None:
+            wandb_run.finish()
         dist.destroy_process_group()
 
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Iterable, List, Union
 
 import torch
@@ -24,6 +25,7 @@ from torch.distributed.checkpoint.metadata import (
 )
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
+from vescale.dtensor.placement_types import RaggedShard
 
 
 def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
@@ -59,6 +61,31 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
         # Calculate the global shape using the sum of the sharding dim sizes.
         cumulative_shape[shard_dim] = sum(s[shard_dim] for s in global_shapes)
 
+    def _update_ragged_offsets_and_cumulative_shape(
+        mesh_dim: int,
+        placement: RaggedShard,
+        offsets: List[int],
+        cumulative_shape: List[int],
+    ):
+        if len(local_shape) != 1:
+            raise ValueError("RaggedShard local tensors must be flat")
+        shard_group = device_mesh.get_group(mesh_dim)
+        rank = dist.get_rank(shard_group)
+        local_unit = placement.local_units[rank]
+        if local_unit == 0:
+            ratio = 0
+        else:
+            if local_shape[0] % local_unit != 0:
+                raise ValueError(
+                    f"RaggedShard local shape {local_shape} is not divisible by "
+                    f"local_units[{rank}]={local_unit}"
+                )
+            ratio = local_shape[0] // local_unit
+        if ratio == 0:
+            ratio = math.prod(dtensor.shape) // sum(placement.local_units)
+        offsets[0] += sum(placement.local_units[:rank]) * ratio
+        cumulative_shape[0] = sum(placement.local_units) * ratio
+
     # Get the shard placements order.
     shard_order = getattr(device_mesh, "_shard_order", None)
     if shard_order is None:
@@ -81,7 +108,11 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
 
     for mesh_dim in reversed(shard_order):
         p = dtensor.placements[mesh_dim]
-        if isinstance(p, (Shard, _StridedShard)):
+        if isinstance(p, RaggedShard):
+            _update_ragged_offsets_and_cumulative_shape(
+                mesh_dim, p, offsets, cumulative_shape
+            )
+        elif isinstance(p, (Shard, _StridedShard)):
             _update_offsets_and_cumulative_shape(mesh_dim, offsets, cumulative_shape)
         elif isinstance(p, Replicate):
             # If we have a replicate placement, we do not need to update offsets
@@ -91,6 +122,10 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
             raise ValueError(f"Unsupported placement type {type(p)} in DTensor: {dtensor}")
 
     return ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape))
+
+
+def _has_ragged_shard(dtensor: DTensor) -> bool:
+    return any(isinstance(placement, RaggedShard) for placement in dtensor.placements)
 
 
 def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
@@ -157,20 +192,38 @@ def validate_uneven_dtensor(dtensor: DTensor) -> None:
     # gather_and_compute_chunk_metadata will ensure that all chunks do not overlap.
     chunk_meta = gather_and_compute_chunk_metadata(dtensor)
 
-    # Validate that each chunk's metadata is within bounds.
-    assert all(
-        [
-            0 <= offset and offset + size <= dtensor.shape[dim]
-            for (dim, (offset, size)) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
-        ]
-    ), (
-        "[Grove-FSDP] DTensor chunk metadata is invalid. "
-        f"Offsets: {chunk_meta.offsets}, "
-        f"Sizes: {chunk_meta.sizes}, "
-        f"Global shape: {dtensor.shape}, "
-        f"Local shape: {dtensor.to_local().shape}, "
-        f"Device mesh: {dtensor.device_mesh}."
-    )
+    if _has_ragged_shard(dtensor):
+        assert len(chunk_meta.offsets) == 1 and len(chunk_meta.sizes) == 1, (
+            "[Megatron-FSDP] RaggedShard chunk metadata must be flat. "
+            f"Offsets: {chunk_meta.offsets}, Sizes: {chunk_meta.sizes}."
+        )
+        assert (
+            0 <= chunk_meta.offsets[0]
+            and chunk_meta.offsets[0] + chunk_meta.sizes[0] <= dtensor.numel()
+        ), (
+            "[Megatron-FSDP] RaggedShard chunk metadata is invalid. "
+            f"Offsets: {chunk_meta.offsets}, "
+            f"Sizes: {chunk_meta.sizes}, "
+            f"Global numel: {dtensor.numel()}, "
+            f"Global shape: {dtensor.shape}, "
+            f"Local shape: {dtensor.to_local().shape}, "
+            f"Device mesh: {dtensor.device_mesh}."
+        )
+    else:
+        # Validate that each chunk's metadata is within bounds.
+        assert all(
+            [
+                0 <= offset and offset + size <= dtensor.shape[dim]
+                for (dim, (offset, size)) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
+            ]
+        ), (
+            "[Megatron-FSDP] DTensor chunk metadata is invalid. "
+            f"Offsets: {chunk_meta.offsets}, "
+            f"Sizes: {chunk_meta.sizes}, "
+            f"Global shape: {dtensor.shape}, "
+            f"Local shape: {dtensor.to_local().shape}, "
+            f"Device mesh: {dtensor.device_mesh}."
+        )
 
     # Check that all boundaries (start and end) are touched.
     # Skip under fake process group — all_reduce is a no-op so only rank 0's
@@ -178,13 +231,16 @@ def validate_uneven_dtensor(dtensor: DTensor) -> None:
     if torch.distributed.is_initialized() and torch.distributed.get_backend() == 'fake':
         return
 
-    boundary_checks = torch.tensor(
-        [
-            [offset == 0, offset + size == dtensor.shape[dim]]
-            for (dim, (offset, size)) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
-        ],
-        dtype=torch.int,
-    ).cuda()
+    if _has_ragged_shard(dtensor):
+        return
+    else:
+        boundary_checks = torch.tensor(
+            [
+                [offset == 0, offset + size == dtensor.shape[dim]]
+                for (dim, (offset, size)) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
+            ],
+            dtype=torch.int,
+        ).cuda()
 
     for i, p in enumerate(dtensor.placements):
         if isinstance(p, Shard) or isinstance(p, _StridedShard):
@@ -194,7 +250,7 @@ def validate_uneven_dtensor(dtensor: DTensor) -> None:
                 group=dtensor.device_mesh.get_group(i),
             )
     assert torch.all(boundary_checks), (
-        "[Grove-FSDP] DTensor chunk metadata boundary check failed. "
+        "[Megatron-FSDP] DTensor chunk metadata boundary check failed. "
         f"Offsets: {chunk_meta.offsets}, "
         f"Sizes: {chunk_meta.sizes}, "
         f"Global shape: {dtensor.shape}, "

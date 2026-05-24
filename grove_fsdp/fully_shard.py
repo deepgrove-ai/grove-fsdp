@@ -22,18 +22,27 @@ from torch.distributed import DeviceMesh
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 
-from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .grove_fsdp import GroveFSDP
+from .grove_fsdp import GroveFSDP as MegatronFSDP
 from .mixed_precision import MixedPrecisionPolicy
 from .uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .utils import FSDPDistributedIndex, create_updated_function_signature
+
+try:
+    # Default to Megatron-LM FW.
+    from megatron.core.distributed.distributed_data_parallel_config import (
+        DistributedDataParallelConfig,
+    )
+except ImportError:
+    # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
+    from .distributed_data_parallel_config import DistributedDataParallelConfig
+
 
 logger = logging.getLogger(__name__)
 
 
 class ShardingStrategy(IntEnum):
     """
-    IntEnum to track the abbreviated sharding strategy for Grove-FSDP.
+    IntEnum to track the abbreviated sharding strategy for Megatron-FSDP.
 
     - `0` or `no_shard` implies that your model is not sharded. Similar memory usage to `DDP`.
     - `1` or `optim` implies that your optimizer state is sharded. Similar to optimizer
@@ -56,7 +65,7 @@ def experimental_api(func: Callable) -> Callable:
     Mark a function or class as experimental API in Megatron CI/CD.
 
     TODO(@cspades): Copied from megatron.core.utils to avoid depending on MCore
-    for Grove-FSDP. Should remove when the API is no longer experimental.
+    for Megatron-FSDP. Should remove when the API is no longer experimental.
     """
     func._experimental_api = True
     return func
@@ -95,22 +104,25 @@ def fully_shard_model(
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
     use_decoupled_grad: bool = False,
-    grove_fsdp_dbuffer_workspace_size: int = 0,
+    grove_fsdp_dbuffer_workspace_size: int = 2,
+    grove_fsdp_release_non_fsdp_unit_params: bool = True,
+    grove_fsdp_coalesce_all_gather: bool = True,
+    grove_fsdp_inplace_reduce_scatter: bool = True,
 ) -> torch.nn.Module:
     """
-    Fully-shard the model for Grove-FSDP. This wraps the model in a GroveFSDP
+    Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
     class that schedules the sharding lifecycle of the model parameters and gradients
     during training and inference.
 
-    The original `torch.nn.Module` can be accessed at `GroveFSDP.module`.
+    The original `torch.nn.Module` can be accessed at `MegatronFSDP.module`.
 
     Args:
         module (torch.nn.Module):
-            The PyTorch module fully-sharded and managed by Grove-FSDP.
+            The PyTorch module fully-sharded and managed by Megatron-FSDP.
 
         device_mesh (Optional[DeviceMesh]):
             Device mesh object defining the topology for distributed training. If not provided,
-            Grove-FSDP will build a default FSDP DeviceMesh.
+            Megatron-FSDP will build a default FSDP DeviceMesh.
 
         dp_shard_dim (Optional[str]):
             Name of the data parallel sharding sub-mesh in the device_mesh. Supports
@@ -150,11 +162,11 @@ def fully_shard_model(
 
         fsdp_unit_modules (Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]]):
             List of (sub-)module classes or (sub-)module class import paths that are "units",
-            which are torch.nn.Module(s) that are sharded and scheduled by Grove-FSDP.
+            which are torch.nn.Module(s) that are sharded and scheduled by Megatron-FSDP.
             In particular, FSDP unit module parameters can be "safely" deallocated after
             the forward() or backward() pass without interfering with other computational
             operations that rely on those parameters in the complete PyTorch model.
-            This information is utilized by Grove-FSDP to optimally shard, gather, and
+            This information is utilized by Megatron-FSDP to optimally shard, gather, and
             overlap communications during the forward and backward pass of the module.
             Defaults to None, which is peak-memory-equivalent to DDP / "no_shard".
 
@@ -188,9 +200,9 @@ def fully_shard_model(
             implementing a custom Module.reset_parameters() or Module._reset_parameters() method.
             Defaults to False.
 
-        mixed_precision_policy (grove_fsdp.MixedPrecisionPolicy):
-            Grove-FSDP mixed-precision config that controls compute and communication precision.
-            Default values are defined in `grove_fsdp.MixedPrecisionPolicy`.
+        mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy):
+            Megatron-FSDP mixed-precision config that controls compute and communication precision.
+            Default values are defined in `megatron_fsdp.MixedPrecisionPolicy`.
 
         overlap_grad_reduce (bool):
             Whether to overlap gradient reduce-scatter (or all-reduce) with backward compute.
@@ -201,11 +213,11 @@ def fully_shard_model(
             Defaults to True.
 
         sync_model_each_microbatch (bool): Whether to sync parameters and install gradients on
-            each training step. When disabled, Grove-FSDP will overlap reduce-scatter with
+            each training step. When disabled, Megatron-FSDP will overlap reduce-scatter with
             subsequent compute and delay HSDP gather and reduce operations per optimization cycle,
             which improves performance and throughput when using delayed optimization strategies
             such as gradient accumulation. Defaults to True, can be modified before the model
-            forward / backward pass via GroveFSDP.set_model_auto_sync(bool) or controlled
+            forward / backward pass via MegatronFSDP.set_model_auto_sync(bool) or controlled
             with the (no_)sync context managers or microbatch_count and is_last_microbatch.
 
         preproc_state_dict_for_dcp_ckpt (bool):
@@ -229,7 +241,7 @@ def fully_shard_model(
             Defaults to False.
 
         keep_fp8_transpose_cache (bool):
-            Whether to keep the FP8 transpose cache when using a Grove FSDP.
+            Whether to keep the FP8 transpose cache when using a Megatron FSDP.
             Defaults to False.
 
         nccl_ub (bool):
@@ -257,12 +269,8 @@ def fully_shard_model(
             If true, reduced gradients are installed into `Parameter.decoupled_grad` instead
             of `Parameter.grad`. Defaults to False.
 
-        grove_fsdp_dbuffer_workspace_size (int):
-            Opt-in reusable DBuffer workspace pool size for temporary communication
-            buckets. Defaults to 0, which keeps the storage-resize path.
-
     Returns:
-        model (GroveFSDP): The wrapped Grove-FSDP model configured for FSDP.
+        model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
     """
     # If no DeviceMesh or FSDP dimension is provided, then build an FSDP DeviceMesh.
     # Modify arguments into arguments necessary for vanilla FSDP.
@@ -283,7 +291,7 @@ def fully_shard_model(
         )
 
     # Parse zero_dp_strategy and outer_dp_sharding_strategy.
-    # TODO(@cspades): Integrate this Enum into GroveFSDP.
+    # TODO(@cspades): Integrate this Enum into MegatronFSDP.
     if zero_dp_strategy == ShardingStrategy.NO_SHARD:
         zero_dp_strategy = "no_shard"
     elif zero_dp_strategy == ShardingStrategy.OPTIM:
@@ -343,7 +351,7 @@ def fully_shard_model(
             "supported or necessary for the 'no_shard' / 0 sharding strategy."
         )
 
-    # DDP Config for Grove FSDP.
+    # DDP Config for Megatron FSDP.
     ddp_config = DistributedDataParallelConfig(
         data_parallel_sharding_strategy=zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
@@ -355,14 +363,17 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
-        grove_fsdp_use_decoupled_grad=use_decoupled_grad,
+        megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
         grove_fsdp_dbuffer_workspace_size=grove_fsdp_dbuffer_workspace_size,
+        grove_fsdp_release_non_fsdp_unit_params=grove_fsdp_release_non_fsdp_unit_params,
+        grove_fsdp_coalesce_all_gather=grove_fsdp_coalesce_all_gather,
+        grove_fsdp_inplace_reduce_scatter=grove_fsdp_inplace_reduce_scatter,
     )
 
     # Create FSDPDistributedIndex.
     dist_index = FSDPDistributedIndex(
         device_mesh=device_mesh,
-        # Always required for Grove-FSDP.
+        # Always required for Megatron-FSDP.
         dp_shard_dim=dp_shard_dim,
         # Only required for HSDP.
         dp_outer_dim=dp_outer_dim,
@@ -376,15 +387,15 @@ def fully_shard_model(
         hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         # Access to flattened DP rank assignments for HSDP.
         hsdp_outer_dp_shard=_outer_fsdp_sharding,
-        # Only required for Grove-FSDP + EP.
+        # Only required for Megatron-FSDP + EP.
         expt_device_mesh=expt_device_mesh,
         # AG groups for AG/RS overlap optimization.
         fsdp_group_ag=fsdp_group_ag,
         expt_fsdp_group_ag=expt_fsdp_group_ag,
     )
 
-    # Wrap model in Grove FSDP.
-    model = GroveFSDP(
+    # Wrap model in Megatron FSDP.
+    model = MegatronFSDP(
         module=module,
         dist_index=dist_index,
         ddp_config=ddp_config,
@@ -403,7 +414,7 @@ def fully_shard_model(
     if preproc_state_dict_for_dcp_ckpt and zero_dp_strategy != "no_shard":
 
         def remove_te_extra_state(state_dict):
-            # Grove-FSDP does not support FP8 extra state checkpointing in TE.
+            # Megatron-FSDP does not support FP8 extra state checkpointing in TE.
             extra_state_keys = [k for k in state_dict.keys() if k.endswith("_extra_state")]
             for key in extra_state_keys:
                 state_dict.pop(key)
@@ -419,7 +430,7 @@ def fully_shard_model(
             )
         )
 
-    # Return the wrapped Grove-FSDP model.
+    # Return the wrapped Megatron-FSDP model.
     return model
 
 
@@ -428,16 +439,16 @@ def fully_shard_optimizer(
     optimizer: torch.optim.Optimizer, preproc_state_dict_for_dcp_ckpt: bool = True
 ) -> torch.optim.Optimizer:
     """
-    Fully shard the optimizer for Grove-FSDP. This is an in-place operation on the optimizer
-    instance, which modifies the optimizer to call methods exposed by the GroveFSDP model API.
+    Fully shard the optimizer for Megatron-FSDP. This is an in-place operation on the optimizer
+    instance, which modifies the optimizer to call methods exposed by the MegatronFSDP model API.
 
-    The optimizer should be registered on the GroveFSDP distributed model parameters:
+    The optimizer should be registered on the MegatronFSDP distributed model parameters:
     ```
         # Fully-shard the model.
         mfsdp_model = fully_shard_model(model, ...)
 
         # Register the fully-sharded parameters with the optimizer.
-        # Use GroveFSDP._replace_param_with_distributed_if_needed()
+        # Use MegatronFSDP._replace_param_with_distributed_if_needed()
         # to swap to the distributed optimizer state parameters.
         optimizer = fully_shard_optimizer(Adam(params=mfsdp_model.parameters()))
     ```
@@ -445,30 +456,30 @@ def fully_shard_optimizer(
     Args:
         optimizer (torch.optim.Optimizer):
             (Distributed) optimizer for training the model, which is extended to automatically
-            execute necessary Grove-FSDP operations during the training loop.
+            execute necessary Megatron-FSDP operations during the training loop.
 
         preproc_state_dict_for_dcp_ckpt (bool):
             Whether to preprocess the state dict for DCP checkpointing. Defaults to True.
 
     Returns:
-        optimizer (torch.optim.Optimizer): The in-place modified optimizer for Grove-FSDP.
+        optimizer (torch.optim.Optimizer): The in-place modified optimizer for Megatron-FSDP.
     """
-    # Extract a reference to GroveFSDP from the first registered Parameter.
+    # Extract a reference to MegatronFSDP from the first registered Parameter.
     if not optimizer.param_groups:
         raise ValueError(
-            f"[GroveFSDP fully_shard_optimizer()] Provided optimizer doesn't "
+            f"[MegatronFSDP fully_shard_optimizer()] Provided optimizer doesn't "
             f"have any registered parameters: {optimizer}"
         )
     first_mfsdp_param = optimizer.param_groups[0][next(iter(optimizer.param_groups[0]))][0]
-    if not getattr(first_mfsdp_param, "_grove_fsdp_model", None):
+    if not getattr(first_mfsdp_param, "_megatron_fsdp_model", None):
         raise ValueError(
-            f"[GroveFSDP fully_shard_optimizer()] Could not retrieve a reference to "
-            f"GroveFSDP from the first registered Parameter: {first_mfsdp_param} \n"
-            "Make sure the optimizer is registered to the GroveFSDP distributed "
-            "parameters via GroveFSDP._replace_param_with_distributed_if_needed() "
-            "before initializing the optimizer on the GroveFSDP model. "
+            f"[MegatronFSDP fully_shard_optimizer()] Could not retrieve a reference to "
+            f"MegatronFSDP from the first registered Parameter: {first_mfsdp_param} \n"
+            "Make sure the optimizer is registered to the MegatronFSDP distributed "
+            "parameters via MegatronFSDP._replace_param_with_distributed_if_needed() "
+            "before initializing the optimizer on the MegatronFSDP model. "
         )
-    mfsdp_model = first_mfsdp_param._grove_fsdp_model
+    mfsdp_model = first_mfsdp_param._megatron_fsdp_model
 
     # Save a reference to the optimizer.step() and optimizer.zero_grad() methods.
     optimizer_step_base_func = type(optimizer).step
@@ -491,17 +502,17 @@ def fully_shard_optimizer(
     # Define a new optimizer.step() method that distributes optimizer state and gradients,
     # waits for asynchronous gradient reduce-scatter work to be completed, and updates
     # model weights. These options can be turned off via arguments in optimizer.step().
-    def grove_fsdp_optimizer_step(optimizer, *args, **kwargs):
+    def megatron_fsdp_optimizer_step(optimizer, *args, **kwargs):
         # Extract extended kwargs.
         sync_grad_before_optimizer_step = kwargs.pop("sync_grad_before_optimizer_step", True)
         install_optimized_model_weights = kwargs.pop("install_optimized_model_weights", True)
 
         # Synchronize reduce-scatter and all-gather operations for all model gradients
         # and parameters, attach gradients to the optimizer state, and replace the raw
-        # module parameters with Grove-FSDP-managed optimizer parameters & states in
+        # module parameters with Megatron-FSDP-managed optimizer parameters & states in
         # preparation for (distributed) optimization.
-        # NOTE: Only necessary if GroveFSDP.model_auto_sync = False, in which case
-        # gradient synchronization is not automatically handled by GroveFSDP during
+        # NOTE: Only necessary if MegatronFSDP.model_auto_sync = False, in which case
+        # gradient synchronization is not automatically handled by MegatronFSDP during
         # the post-backward hook and we need to synchronize manually.
         if sync_grad_before_optimizer_step and not mfsdp_model.model_auto_sync:
             mfsdp_model.finish_grad_sync()
@@ -514,31 +525,31 @@ def fully_shard_optimizer(
             mfsdp_model.install_optimized_model_weights()
 
     # Define a new optimizer.zero_grad() method that zeros the gradient in both
-    # the optimizer as well as the Grove-FSDP gradient buffer. These options
+    # the optimizer as well as the Megatron-FSDP gradient buffer. These options
     # can be turned off via arguments in optimizer.zero_grad().
-    def grove_fsdp_optimizer_zero_grad(optimizer, *args, **kwargs):
+    def megatron_fsdp_optimizer_zero_grad(optimizer, *args, **kwargs):
         # Extract extended kwargs.
         zero_grad_buffer = kwargs.pop("zero_grad_buffer", True)
 
         # Execute the base optimizer.zero_grad() on the model optimizer named parameters.
         optimizer_zero_grad_base_func(optimizer, *args, **kwargs)
 
-        # Zero out the gradient in the Grove-FSDP gradient buffer.
+        # Zero out the gradient in the Megatron-FSDP gradient buffer.
         if zero_grad_buffer:
             mfsdp_model.zero_grad_buffer()
 
     # Override the optimizer.step() and optimizer.zero_grad() methods to support
-    # Grove-FSDP operations.
-    grove_fsdp_optimizer_step.__signature__ = create_updated_function_signature(
+    # Megatron-FSDP operations.
+    megatron_fsdp_optimizer_step.__signature__ = create_updated_function_signature(
         optimizer_step_base_func,
         sync_grad_before_optimizer_step=True,
         install_optimized_model_weights=True,
     )
-    optimizer.step = types.MethodType(grove_fsdp_optimizer_step, optimizer)
-    grove_fsdp_optimizer_zero_grad.__signature__ = create_updated_function_signature(
+    optimizer.step = types.MethodType(megatron_fsdp_optimizer_step, optimizer)
+    megatron_fsdp_optimizer_zero_grad.__signature__ = create_updated_function_signature(
         optimizer_zero_grad_base_func, zero_grad_buffer=True
     )
-    optimizer.zero_grad = types.MethodType(grove_fsdp_optimizer_zero_grad, optimizer)
+    optimizer.zero_grad = types.MethodType(megatron_fsdp_optimizer_zero_grad, optimizer)
 
     if preproc_state_dict_for_dcp_ckpt:
 
@@ -574,16 +585,16 @@ def fully_shard_optimizer(
                 set([key for state in optim_state_dtensor_keys for key in state])
             )
 
-            # NOTE(@cspades): Re-construct the Grove-FSDP distributed parameter
+            # NOTE(@cspades): Re-construct the Megatron-FSDP distributed parameter
             # to index mapping as implemented in torch.optim.Optimizer.state_dict():
             # https://github.com/pytorch/pytorch/blob/main/torch/optim/optimizer.py
             # Simply put, the index maps to the very first appearance of id(param)
             # looping through all parameters in all groups with memory address
-            # equivalent to the distributed parameter managed by Grove-FSDP.
+            # equivalent to the distributed parameter managed by Megatron-FSDP.
             param_state_idx = {}
             idx = 0
             # For all empty parameters, mock empty DTensors for all empty parameters
-            # of Grove-FSDP's unevenly-distributed optimizer state into a shallow
+            # of Megatron-FSDP's unevenly-distributed optimizer state into a shallow
             # copy of the state dictionary to synchronize and pre-process a global
             # variant of the optimizer state in preparation for Torch DCP. This allows
             # us to sync the non-empty DTensor shard metadata across sharding groups
@@ -663,19 +674,19 @@ def fully_shard(
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
     use_decoupled_grad: bool = False,
-) -> tuple[GroveFSDP, torch.optim.Optimizer]:
+) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
-    Fully shard the model and the optimizer for Grove-FSDP.
+    Fully shard the model and the optimizer for Megatron-FSDP.
 
-    Wraps the model as an Grove-FSDP module, and modifies the optimizer to
-    be compatible with the Grove-FSDP training strategy.
+    Wraps the model as an Megatron-FSDP module, and modifies the optimizer to
+    be compatible with the Megatron-FSDP training strategy.
 
     Args:
         Union of arguments from fully_shard_model and fully_shard_optimizer.
 
     Returns:
-        torch.nn.Module: The wrapped Grove-FSDP model configured for distributed training.
-        torch.optim.Optimizer: The Grove-FSDP-compliant optimizer for training the model.
+        torch.nn.Module: The wrapped Megatron-FSDP model configured for distributed training.
+        torch.optim.Optimizer: The Megatron-FSDP-compliant optimizer for training the model.
 
     Note:
         This implementation uses NVIDIA's FSDP which includes optimizations specific
@@ -715,9 +726,9 @@ def fully_shard(
         use_decoupled_grad=use_decoupled_grad,
     )
 
-    # Extend optimizer methods to support Grove-FSDP operations.
+    # Extend optimizer methods to support Megatron-FSDP operations.
     # Replace the optimizer module parameter references with
-    # Grove-FSDP-managed distributed parameters.
+    # Megatron-FSDP-managed distributed parameters.
     model._replace_param_with_distributed_if_needed()
     optimizer.param_groups.clear()
     optimizer.state.clear()

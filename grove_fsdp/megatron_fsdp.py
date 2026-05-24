@@ -103,7 +103,7 @@ def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
             param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param])
 
 
-class GroveFSDP(torch.nn.Module):
+class MegatronFSDP(torch.nn.Module):
     """Fully Sharded Data Parallel training.
 
     A distributed training wrapper that shards model parameters, gradients and optimizer
@@ -1457,21 +1457,6 @@ class GroveFSDP(torch.nn.Module):
             # Call the forward pass of the wrapped module.
             output = self.module.forward(*inputs, **kwargs)
             return output
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError as exc:
-            module = self.__dict__.get("module")
-            if module is None:
-                modules = self.__dict__.get("_modules", {})
-                module = modules.get("module")
-            if module is not None and hasattr(module, name):
-                return getattr(module, name)
-            raise exc
-
-
-MegatronFSDP = GroveFSDP
 
 
 class RegisterFSDPBackwardFunction(torch.autograd.Function):

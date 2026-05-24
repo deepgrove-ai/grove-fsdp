@@ -1,7 +1,7 @@
 import torch
+from vescale.dtensor.placement_types import RaggedShard
 
 from grove_fsdp import GroveFSDP, fully_shard_model
-from grove_fsdp.dbuffer import RaggedShard
 from grove_fsdp.distributed_data_parallel_config import DistributedDataParallelConfig
 
 

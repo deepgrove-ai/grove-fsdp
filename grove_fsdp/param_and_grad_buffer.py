@@ -31,9 +31,20 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 import torch
 from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from vescale.dtensor.placement_types import RaggedShard
 
-from .dbuffer import DistributedBuffer, plan_dbuffer_layout
-from .distributed_data_parallel_config import DistributedDataParallelConfig
+from .dbuffer import (
+    DBUFFER_SHARD,
+    DBufferDeviceTopology,
+    DBufferItem,
+    DBufferPlan,
+    DBufferShard,
+    DBufferShardingSpec,
+    DistributedBuffer,
+    _infer_ragged_dims,
+    _item_local_units,
+    plan_dbuffer_layout,
+)
 from .mixed_precision import (
     MixedPrecisionPolicy,
     fp8_discard_transpose_cache,
@@ -62,17 +73,23 @@ logger = logging.getLogger(__name__)
 
 
 try:
+    # Default to Megatron-LM FW.
+    from megatron.core.distributed.distributed_data_parallel_config import (
+        DistributedDataParallelConfig,
+    )
     from megatron.core.tensor_parallel import get_cuda_rng_tracker
     from megatron.core.utils import is_submodule
 
     HAVE_MCORE = True
-    logger.info("Detected Megatron Core utilities.")
+    logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
 
 except ImportError:
+    # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
+    from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import get_cuda_rng_tracker, is_submodule
 
     HAVE_MCORE = False
-    logger.info("Megatron Core is not installed; using Grove-FSDP standalone utilities.")
+    logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
 
 try:
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
@@ -91,11 +108,16 @@ try:
     NCCL_ALLOCATOR = "MCORE"
 except ImportError:
     try:
-        import apex.contrib.nccl_allocator as nccl_allocator
+        from . import nccl_allocator
 
-        NCCL_ALLOCATOR = "APEX"
+        NCCL_ALLOCATOR = "MCORE"
     except ImportError:
-        nccl_allocator = None
+        try:
+            import apex.contrib.nccl_allocator as nccl_allocator
+
+            NCCL_ALLOCATOR = "APEX"
+        except ImportError:
+            nccl_allocator = None
 
 NCCL_MEMORY_POOL = None
 
@@ -245,6 +267,10 @@ class BucketingPolicy:
     data_parallel_sharding_strategy: str = "no_shard"
 
 
+def _pad(number_to_be_padded: int, divisor: int) -> int:
+    return int(math.ceil(number_to_be_padded / divisor) * divisor)
+
+
 def _get_ragged_shard_block_size_fn(
     ddp_config: DistributedDataParallelConfig,
 ) -> Optional[Callable[[torch.Size], int]]:
@@ -270,6 +296,103 @@ def _get_ragged_shard_param_block_sizes(
     if ragged_param_block_size_fn is None:
         return None
     return [int(ragged_param_block_size_fn(param)) for param in params]
+
+
+def _dbuffer_plan_to_legacy_indices(
+    plan: DBufferPlan,
+    bucket_id: int,
+) -> Tuple[Dict[int, TensorItemIndex], BucketIndex, ShardBucketIndex]:
+    item_index_map = {
+        item.item_id: TensorItemIndex(
+            global_data_index=item.global_data_index,
+            size=item.size,
+            item_id=item.item_id,
+            bucket_id=bucket_id,
+            shape=item.shape,
+        )
+        for item in plan.items
+    }
+    bucket_index = BucketIndex(
+        bucket_id=bucket_id,
+        global_data_index=0,
+        size=plan.bucket_size,
+        items=list(item_index_map.values()),
+    )
+    shard_bucket_index = ShardBucketIndex(
+        bucket_id=plan.shard.bucket_id,
+        global_data_index=plan.shard.global_data_index,
+        local_data_index=plan.shard.local_data_index,
+        bucket_data_index=plan.shard.bucket_data_index,
+        size=plan.shard.size,
+    )
+    return item_index_map, bucket_index, shard_bucket_index
+
+
+def _legacy_indices_to_dbuffer_plan(
+    item_index_map: Dict[int, TensorItemIndex],
+    bucket_index: BucketIndex,
+    shard_bucket_index: ShardBucketIndex,
+    item_block_sizes: Optional[List[int]],
+    block_size_fn: Optional[Callable[[torch.Size], int]],
+    data_parallel_world_size: int,
+) -> DBufferPlan:
+    items = []
+    for item_id, item_index in sorted(item_index_map.items()):
+        shape = torch.Size(item_index.shape)
+        if item_block_sizes is not None:
+            block_size = int(item_block_sizes[item_id])
+        elif block_size_fn is not None:
+            block_size = int(block_size_fn(shape))
+        else:
+            block_size = 1
+        items.append(
+            DBufferItem(
+                item_id=item_id,
+                global_data_index=item_index.global_data_index,
+                size=item_index.size,
+                shape=shape,
+                block_size=block_size,
+                local_units=_item_local_units(
+                    item_index.global_data_index,
+                    item_index.size,
+                    block_size,
+                    shard_bucket_index.size,
+                    data_parallel_world_size,
+                ),
+                ragged_dims=_infer_ragged_dims(shape, block_size),
+            )
+        )
+    return DBufferPlan(
+        bucket_id=bucket_index.bucket_id,
+        bucket_size=bucket_index.size,
+        topology=DBufferDeviceTopology(
+            mesh_shape=(data_parallel_world_size,),
+            coordinate=(shard_bucket_index.bucket_data_index // shard_bucket_index.size,)
+            if shard_bucket_index.size > 0
+            else (0,),
+        ),
+        sharding_spec=DBufferShardingSpec(placements=(DBUFFER_SHARD,)),
+        items=tuple(items),
+        shard=DBufferShard(
+            bucket_id=shard_bucket_index.bucket_id,
+            global_data_index=shard_bucket_index.global_data_index,
+            local_data_index=shard_bucket_index.local_data_index,
+            bucket_data_index=shard_bucket_index.bucket_data_index,
+            size=shard_bucket_index.size,
+        ),
+        ragged_shard=plan_dbuffer_layout(
+            [],
+            0,
+            data_parallel_world_size,
+            True,
+            bucket_index.bucket_id,
+            1,
+            True,
+        ).ragged_shard,
+        tensor_order=tuple(
+            item.item_id for item in sorted(items, key=lambda item: item.global_data_index)
+        ),
+    )
 
 
 def build_data_parallel_buffer_index(
@@ -300,14 +423,7 @@ def build_data_parallel_buffer_index(
             range of every tensor, every bucket and every in bucket local buffer.
     """
 
-    use_ragged_shard_planning = getattr(
-        ddp_config, "grove_fsdp_enable_ragged_shard_planning", True
-    )
     ragged_block_size_fn = _get_ragged_shard_block_size_fn(ddp_config)
-
-    # Plan the layout using a RaggedShard-compatible DBuffer abstraction. This
-    # keeps the existing flat communication contract while choosing bucket
-    # offsets with explicit block-granularity metadata.
     plan = plan_dbuffer_layout(
         elements=elements,
         data_parallel_rank=data_parallel_rank,
@@ -321,41 +437,9 @@ def build_data_parallel_buffer_index(
         align_bucket_to_chunk_size=getattr(
             ddp_config, "grove_fsdp_align_dbuffer_to_chunk_size", False
         ),
-        preserve_item_order=not use_ragged_shard_planning,
+        tensor_order="default",
     )
-
-    item_index_map = {
-        item.item_id: TensorItemIndex(
-            global_data_index=item.global_data_index,
-            size=item.size,
-            item_id=item.item_id,
-            bucket_id=bucket_id,
-            shape=item.shape,
-        )
-        for item in plan.items
-    }
-
-    # Bucket index contains information on what tensor items are in this bucket.
-    bucket_index = BucketIndex(
-        bucket_id=bucket_id,
-        global_data_index=0,
-        size=plan.bucket_size,
-        items=list(item_index_map.values()),
-    )
-
-    # Sharded bucket index contains local bucket shard information.
-    shard_bucket_index = ShardBucketIndex(
-        bucket_id=plan.shard.bucket_id,
-        global_data_index=plan.shard.global_data_index,
-        local_data_index=plan.shard.local_data_index,
-        bucket_data_index=plan.shard.bucket_data_index,
-        size=plan.shard.size,
-    )
-
-    # Return the tensor item index map in the buffer,
-    # the bucket index with information on what items this bucket contains,
-    # and the sharded bucket index.
-    return item_index_map, bucket_index, shard_bucket_index
+    return _dbuffer_plan_to_legacy_indices(plan, bucket_id)
 
 
 def _get_dp_buffer_shard_bucket_index(
@@ -498,6 +582,60 @@ class TemporaryBucketAllocator:
             del self.buckets[bucket_id]
 
 
+class DBufferWorkspaceAllocator(TemporaryBucketAllocator):
+    """Reusable full-bucket workspace allocator for DBuffer communication."""
+
+    def __init__(self, name: str, max_live_workspaces: int = 2):
+        super().__init__()
+        self.name = name
+        self.max_live_workspaces = max(1, int(max_live_workspaces))
+        self.planned_size: Optional[int] = None
+        self.idle: List[Bucket] = []
+        self.live: Dict[int, Bucket] = {}
+        self.workspace_sizes: Dict[int, int] = {}
+        self.num_workspace_allocations = 0
+        self.peak_live_workspaces = 0
+
+    def set_planned_size(self, planned_size: int) -> None:
+        self.planned_size = int(planned_size)
+
+    def allocate(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> Bucket:
+        if self.planned_size is None:
+            self.planned_size = int(size)
+        if size > self.planned_size:
+            raise RuntimeError(
+                f"DBuffer workspace pool '{self.name}' planned size {self.planned_size} "
+                f"is smaller than requested size {size}"
+            )
+        if bucket_id in self.live:
+            return self.live[bucket_id]
+
+        if self.idle:
+            bucket = self.idle.pop()
+        else:
+            alloc_size = self.planned_size
+            bucket = Bucket(data=torch.empty(alloc_size, dtype=dtype, device=device))
+            self.workspace_sizes[self.num_workspace_allocations] = alloc_size
+            self.num_workspace_allocations += 1
+        self.live[bucket_id] = bucket
+        self.peak_live_workspaces = max(self.peak_live_workspaces, len(self.live))
+        return Bucket(data=bucket.data[:size])
+
+    def free(self, bucket_id: int):
+        bucket = self.live.pop(bucket_id, None)
+        if bucket is None:
+            return
+        if len(self.idle) < self.max_live_workspaces:
+            self.idle.append(bucket)
+
+
 class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
     """
     A specialized temporary bucket allocator that resizes the storage of temporary buckets
@@ -530,80 +668,6 @@ class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
         """
         if bucket_id in self.buckets:
             _free_storage(self.buckets[bucket_id].data)
-
-
-class DBufferWorkspaceAllocator(TemporaryBucketAllocator):
-    """Reusable DBuffer workspace pool for temporary full-bucket communication.
-
-    The pool keeps reusable per-dtype workspaces and hands them out by bucket
-    id. This avoids repeated storage resize/free cycles in the default non-NCCL-UB
-    path while still allowing FSDP buckets to be released logically.
-    """
-
-    def __init__(self, name: str, max_live_workspaces: int = 2):
-        super().__init__()
-        if max_live_workspaces <= 0:
-            raise ValueError("max_live_workspaces must be positive")
-        self.name = name
-        self.max_live_workspaces = max_live_workspaces
-        self.planned_size = None
-        self.idle_workspaces = defaultdict(list)
-        self.using_workspaces = {}
-        self.workspace_sizes = {}
-        self.num_workspace_allocations = 0
-        self.peak_live_workspaces = 0
-
-    def set_planned_size(self, size: int) -> None:
-        self.planned_size = max(1, int(size))
-
-    def allocate(
-        self,
-        bucket_id: int,
-        size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        mem_alloc_context: Optional[Callable] = None,
-    ) -> Bucket:
-        key = (dtype, device)
-        if bucket_id in self.using_workspaces:
-            workspace = self.using_workspaces[bucket_id]
-        else:
-            idle = self.idle_workspaces[key]
-            if idle:
-                workspace = idle.pop()
-            else:
-                workspace = (key, self.num_workspace_allocations)
-                self.num_workspace_allocations += 1
-            self.using_workspaces[bucket_id] = workspace
-            self.peak_live_workspaces = max(
-                self.peak_live_workspaces,
-                sum(1 for live_workspace in self.using_workspaces.values() if live_workspace[0] == key),
-            )
-
-        alloc_size = self.planned_size if self.planned_size is not None else size
-        if alloc_size < size:
-            raise RuntimeError(
-                f"DBuffer workspace pool '{self.name}' planned size {alloc_size} "
-                f"is smaller than requested bucket size {size}"
-            )
-        if self.workspace_sizes.get(workspace, 0) < alloc_size:
-            self.workspace_sizes[workspace] = alloc_size
-        _, workspace_id = workspace
-        data = get_global_memory_buffer().get_tensor(
-            [self.workspace_sizes[workspace]],
-            dtype=dtype,
-            name=f"{self.name}_{workspace_id}",
-            mem_alloc_context=mem_alloc_context,
-            device=device,
-        )
-        return Bucket(data=data[:size])
-
-    def free(self, bucket_id: int):
-        workspace = self.using_workspaces.pop(bucket_id, None)
-        if workspace is None:
-            return
-        key, _ = workspace
-        self.idle_workspaces[key].append(workspace)
 
 
 class RotaryBucketAllocator(TemporaryBucketAllocator):
@@ -662,7 +726,6 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
                 dtype=dtype,
                 name=self._get_gbuf_name(buffer_id),
                 mem_alloc_context=mem_alloc_context,
-                device=device,
             )
 
         if bucket_id in self.using_buffer:
@@ -851,11 +914,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 torch.cuda.synchronize()
         return Bucket(
             data=get_global_memory_buffer().get_tensor(
-                [size],
-                dtype=dtype,
-                name=buffer_name,
-                mem_alloc_context=mem_alloc_context,
-                device=device,
+                [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
             )
         )
 
@@ -960,25 +1019,16 @@ class DataParallelBuffer:
             self.item_index_map = item_index_map
             self.bucket_index = bucket_index
             self.shard_bucket_index = shard_bucket_index
-        else:
-            # Build the data parallel buffer index, which contains information
-            # on where each parameter / gradient tensor will be stored in this
-            # distributed buffer.
-            (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
-                build_data_parallel_buffer_index(
-                    param_shapes,
-                    self.dp_rank,
-                    self.dp_world_size,
-                    is_data_distributed,
-                    ddp_config,
-                    bucket_id=bucket_id,
-                    chunk_size_factor=chunk_size_factor,
-                    item_block_sizes=param_block_sizes,
-                )
+            dbuffer_plan = _legacy_indices_to_dbuffer_plan(
+                item_index_map=self.item_index_map,
+                bucket_index=self.bucket_index,
+                shard_bucket_index=self.shard_bucket_index,
+                item_block_sizes=param_block_sizes,
+                block_size_fn=_get_ragged_shard_block_size_fn(ddp_config),
+                data_parallel_world_size=self.dp_world_size,
             )
-
-        self.dbuffer = DistributedBuffer(
-            plan=plan_dbuffer_layout(
+        else:
+            dbuffer_plan = plan_dbuffer_layout(
                 elements=param_shapes,
                 data_parallel_rank=self.dp_rank,
                 data_parallel_world_size=self.dp_world_size,
@@ -995,10 +1045,15 @@ class DataParallelBuffer:
                 align_bucket_to_chunk_size=getattr(
                     ddp_config, "grove_fsdp_align_dbuffer_to_chunk_size", False
                 ),
-                preserve_item_order=not getattr(
-                    ddp_config, "grove_fsdp_enable_ragged_shard_planning", True
-                ),
-            ),
+                tensor_order="default",
+            )
+            (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
+                _dbuffer_plan_to_legacy_indices(dbuffer_plan, bucket_id)
+            )
+
+        self.dbuffer_plan = dbuffer_plan
+        self.dbuffer = DistributedBuffer(
+            plan=self.dbuffer_plan,
             is_data_distributed=is_data_distributed,
         )
         self.data_size = (
@@ -1016,8 +1071,8 @@ class DataParallelBuffer:
         assert (
             data.numel() == self.data_size
         ), f"Data size mismatch: {data.numel()} != {self.data_size}"
+        self.data = data
         self.dbuffer.init_data(data)
-        self.data = self.dbuffer.local_tensor
 
     def fetch_bucket(
         self, dtype: Optional[torch.dtype] = None, set_param_data: bool = False
@@ -1394,8 +1449,8 @@ class ParameterGroup:
             Buffer used to store model weights for data-parallel operations.
         transpose_weight_buffer (Optional[DataParallelBuffer]):
             Buffer used to store transpose weights for data-parallel operations.
-                    main_weight_buffer (Optional[DataParallelBuffer]):
-                        Buffer used to store main model weights for data-parallel operations.
+        main_weight_buffer (Optional[DataParallelBuffer]):
+            Buffer used to store main model weights for data-parallel operations.
         main_grad_buffer (Optional[DataParallelBuffer]):
             Buffer used to store main gradients for data-parallel operations.
         hfsdp_helper_wbuf (Optional[DataParallelBuffer]):
@@ -1694,9 +1749,9 @@ class ParamAndGradBuffer:
             and flatten.
         bucketing_policy (BucketingPolicy): The bucketing policy.
         dist_index (FSDPDistributedIndex): FSDPDistributedIndex object containing references
-            to the process groups and device meshes used by Grove-FSDP.
-        mixed_precision_policy (grove_fsdp.MixedPrecisionPolicy): Configuration for
-            mixed-precision customization of compute and communications in Grove-FSDP.
+            to the process groups and device meshes used by Megatron-FSDP.
+        mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy): Configuration for
+            mixed-precision customization of compute and communications in Megatron-FSDP.
         gradient_scaling_factor (Optional[float]): The gradient scaling factor.
         expert_gradient_scaling_factor (Optional[float]): The expert gradient
             scaling factor.
@@ -1726,7 +1781,7 @@ class ParamAndGradBuffer:
         )
 
         self.ddp_config = ddp_config
-        self.use_decoupled_grad = ddp_config.grove_fsdp_use_decoupled_grad
+        self.use_decoupled_grad = ddp_config.megatron_fsdp_use_decoupled_grad
         self.module = module
         self.bucketing_policy = bucketing_policy
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
@@ -1753,6 +1808,8 @@ class ParamAndGradBuffer:
             # Since the user buffer registration requires (non-dynamic) persistent memory,
             # it always uses fsdp double buffer.
             self.ddp_config.fsdp_double_buffer = True
+            if not self.ddp_config.disable_symmetric_registration and NCCL_ALLOCATOR == "MCORE":
+                self.ddp_config.fsdp_manual_registration = True
             # Initialize the NCCL memory pool.
             global NCCL_MEMORY_POOL
             # Initialize NCCL allocator runtime if available
@@ -1856,6 +1913,8 @@ class ParamAndGradBuffer:
         )
         self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
         self._init_distributed_params()
+        if self.ddp_config.nccl_ub and self.ddp_config.fsdp_manual_registration:
+            self.manual_buffer_registration()
 
         # Initialize the optimizer named parameters.
         self.optimizer_named_parameters = self._init_optimizer_named_parameters()
@@ -1925,6 +1984,32 @@ class ParamAndGradBuffer:
             return mem_alloc_context
         else:
             return nullcontext
+
+    def _uses_symmetric_nccl_ub(self) -> bool:
+        return self.ddp_config.nccl_ub and not self.ddp_config.disable_symmetric_registration
+
+    def _get_symmetric_alloc_size(
+        self, local_size: int, group: Optional[torch.distributed.ProcessGroup] = None
+    ) -> int:
+        """Return a physical allocation size that is symmetric across the group."""
+        local_size = int(local_size)
+        if not self._uses_symmetric_nccl_ub():
+            return local_size
+        if group is None:
+            group = self.ubr_groups[0] if self.ubr_groups else self.dist_index.get_fsdp_group()
+        size_tensor = torch.tensor([local_size], dtype=torch.int64, device=self.device)
+        torch.distributed.all_reduce(size_tensor, op=torch.distributed.ReduceOp.MAX, group=group)
+        return int(size_tensor.item())
+
+    def _empty_symmetric_nccl_slice(
+        self,
+        local_size: int,
+        dtype: torch.dtype,
+        group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> torch.Tensor:
+        alloc_size = self._get_symmetric_alloc_size(local_size, group=group)
+        data = torch.empty(alloc_size, dtype=dtype, device=self.device)
+        return data[:local_size]
 
     def manual_buffer_registration(self):
         """
@@ -2042,7 +2127,7 @@ class ParamAndGradBuffer:
 
         Design goal
         ==========
-        This design extends Grove-FSDP's Hybrid / Fully Sharded Data Parallelism
+        This design extends Megatron-FSDP's Hybrid / Fully Sharded Data Parallelism
         to support *outer* data-parallel (DP) optimizer-state sharding, without
         complicating the per-rank model weight / grad views that are used by the
         forward and backward passes.
@@ -2129,7 +2214,7 @@ class ParamAndGradBuffer:
             partitioning and are aligned with the DP device mesh used for HFSDP
             optimizer sharding.
 
-        - The existing Grove-FSDP weight and grad buffers are repurposed as
+        - The existing Megatron-FSDP weight and grad buffers are repurposed as
             *outer-DP data-parallel buffers*. They:
             - Have a shape / layout that only reflects the DP dimension.
             - Implemented as views into the helper buffers to avoid extra copies.
@@ -2157,7 +2242,7 @@ class ParamAndGradBuffer:
                 * its gradients (from `model gradient buffer`),
                 * and the corresponding optimizer states.
             - This is conceptually similar to ZeRO-style optimizer sharding, but
-                implemented on top of Grove-FSDP's buffer / device-mesh abstractions,
+                implemented on top of Megatron-FSDP's buffer / device-mesh abstractions,
                 using the helper buffers as the single source of truth for persistent
                 data.
 
@@ -2195,9 +2280,9 @@ class ParamAndGradBuffer:
             and self.ddp_config.data_parallel_sharding_strategy != "optim_grads_params"
         ):
             raise NotImplementedError(
-                "[Grove-FSDP] Optimizer fully-sharded HFSDP is only supported "
-                "with full-sharding on DP-Shard.\nGrove-FSDP DP-Shard Strategy: "
-                f"{self.ddp_config.data_parallel_sharding_strategy}\nGrove-FSDP "
+                "[Megatron-FSDP] Optimizer fully-sharded HFSDP is only supported "
+                "with full-sharding on DP-Shard.\nMegatron-FSDP DP-Shard Strategy: "
+                f"{self.ddp_config.data_parallel_sharding_strategy}\nMegatron-FSDP "
                 f"DP-Outer Strategy: {self.ddp_config.outer_dp_sharding_strategy}"
             )
 
@@ -2243,19 +2328,8 @@ class ParamAndGradBuffer:
                 )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
-            workspace_size = getattr(self.ddp_config, "grove_fsdp_dbuffer_workspace_size", 2)
-            if workspace_size > 0:
-                self.weight_alloc = DBufferWorkspaceAllocator(
-                    name="fsdp_params_workspace",
-                    max_live_workspaces=workspace_size,
-                )
-                self.transpose_weight_alloc = DBufferWorkspaceAllocator(
-                    name="fsdp_fp8_transpose_params_workspace",
-                    max_live_workspaces=workspace_size,
-                )
-            else:
-                self.weight_alloc = StorageResizeBasedBucketAllocator()
-                self.transpose_weight_alloc = StorageResizeBasedBucketAllocator()
+            self.weight_alloc = StorageResizeBasedBucketAllocator()
+            self.transpose_weight_alloc = StorageResizeBasedBucketAllocator()
             self.main_grad_alloc = None
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
@@ -2264,7 +2338,11 @@ class ParamAndGradBuffer:
                 self.hsdp_grad_comm_alloc = None
             self.double_buf_units = []
 
-        self.buffer_all_in_one = True
+        # NCCL symmetric window registration can reject very large single segments.
+        # Keep the default Megatron all-in-one allocation for normal paths, but split
+        # persistent main buffers by parameter group for symmetric UB so the NCCL
+        # mempool registers smaller windows.
+        self.buffer_all_in_one = not self._uses_symmetric_nccl_ub()
         buffer_size = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
 
         # For all bucket groups (partitioned parameter groups)...
@@ -2492,29 +2570,6 @@ class ParamAndGradBuffer:
                     **hfsdp_kwargs,
                 )
 
-        if isinstance(self.weight_alloc, DBufferWorkspaceAllocator):
-            self.weight_alloc.set_planned_size(
-                max(
-                    (
-                        group.model_weight_buffer.bucket_index.size
-                        for group in self.parameter_groups
-                        if group.model_weight_buffer is not None
-                    ),
-                    default=1,
-                )
-            )
-        if isinstance(self.transpose_weight_alloc, DBufferWorkspaceAllocator):
-            self.transpose_weight_alloc.set_planned_size(
-                max(
-                    (
-                        group.transpose_weight_buffer.bucket_index.size
-                        for group in self.parameter_groups
-                        if group.transpose_weight_buffer is not None
-                    ),
-                    default=1,
-                )
-            )
-
         reset_context_args = {"init_param_with_fp8": self.ddp_config.fp8_param_gather}
         module_reset_flag = {}
         if self.reset_parameters_for_meta_device_init_module:
@@ -2548,15 +2603,17 @@ class ParamAndGradBuffer:
         # of all the parameters across ranks in the model weight buffer.
         for group in self.parameter_groups:
             wbuf = group.model_weight_buffer
-            direct_sharded_weight_init = False
             if wbuf:
+                wbuf_alloc_size = self._get_symmetric_alloc_size(
+                    wbuf.data_size, group=wbuf.data_parallel_group
+                )
                 with self.mem_alloc_context():
                     if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wbuf,
                             wbuf,
-                            mem_alloc=lambda size, dtype: torch.empty(
-                                size, dtype=dtype, device=self.device
+                            mem_alloc=lambda size, dtype: self._empty_symmetric_nccl_slice(
+                                size, dtype, group=wbuf.data_parallel_group
                             ),
                             outer_dp_group=self.dist_index.get_outer_fsdp_group(
                                 is_expert_parallel=group.is_expert_param
@@ -2565,21 +2622,24 @@ class ParamAndGradBuffer:
                     else:
                         # When not using HSDP, the main buffer shards across the FSDP group.
                         wbuf.init_data(
-                            torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device)
+                            torch.empty(wbuf_alloc_size, dtype=wbuf.dtype, device=self.device)[
+                                : wbuf.data_size
+                            ]
                         )
-                        direct_sharded_weight_init = wbuf.is_data_distributed
-                bucket = None if direct_sharded_weight_init else wbuf.fetch_bucket()
+                bucket = wbuf.fetch_bucket()
 
             tbuf = group.transpose_weight_buffer
             if tbuf:
-                direct_sharded_weight_init = False
+                tbuf_alloc_size = self._get_symmetric_alloc_size(
+                    tbuf.data_size, group=tbuf.data_parallel_group
+                )
                 with self.mem_alloc_context():
                     if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wtbuf,
                             tbuf,
-                            mem_alloc=lambda size, dtype: torch.empty(
-                                size, dtype=dtype, device=self.device
+                            mem_alloc=lambda size, dtype: self._empty_symmetric_nccl_slice(
+                                size, dtype, group=tbuf.data_parallel_group
                             ),
                             outer_dp_group=self.dist_index.get_outer_fsdp_group(
                                 is_expert_parallel=group.is_expert_param
@@ -2588,7 +2648,9 @@ class ParamAndGradBuffer:
                     else:
                         # Initialize the transpose buffer.
                         tbuf.init_data(
-                            torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device)
+                            torch.empty(tbuf_alloc_size, dtype=tbuf.dtype, device=self.device)[
+                                : tbuf.data_size
+                            ]
                         )
                 transpose_bucket = tbuf.fetch_bucket()
 
@@ -2597,7 +2659,6 @@ class ParamAndGradBuffer:
                 # Manually instantiate an empty tensor into the main weight buffer.
                 mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
             for item_id, p in enumerate(group.params):
-                free_original_param_storage = False
                 # Model Weight (Low-Precision) Buffer Initialization
                 if wbuf:
                     if self.reset_parameters_for_meta_device_init_module and p.is_meta:
@@ -2658,69 +2719,55 @@ class ParamAndGradBuffer:
                     if tbuf:
                         tbuf.set_item(item_id, p_local)
 
-                    if (
-                        direct_sharded_weight_init
-                        and not is_float8tensor(p_local)
-                        and not isinstance(p, DTensor)
-                    ):
-                        # veScale-style DBuffer initialization: copy each parameter's
-                        # local shard directly into persistent DBuffer storage and
-                        # release the original full parameter storage after optional
-                        # main-weight initialization below. Avoiding the temporary
-                        # full bucket lowers initialization peak memory.
-                        free_original_param_storage = True
+                    # Retrieve the newly allocated parameter data from the global bucket.
+                    # Attach the bucket-allocated parameter data to the module parameter,
+                    # to use the bucket-allocated data for autograd and NCCL.
+                    new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(p_local.shape)
+                    if tbuf:
+                        new_transpose_data = tbuf.get_item_from_bucket(
+                            transpose_bucket, item_id
+                        ).view(p_local.shape)
                     else:
-                        # Retrieve the newly allocated parameter data from the global bucket.
-                        # Attach the bucket-allocated parameter data to the module parameter,
-                        # to use the bucket-allocated data for autograd and NCCL.
-                        new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(
-                            p_local.shape
-                        )
-                        if tbuf:
-                            new_transpose_data = tbuf.get_item_from_bucket(
-                                transpose_bucket, item_id
-                            ).view(p_local.shape)
-                        else:
-                            new_transpose_data = None
+                        new_transpose_data = None
 
-                        if is_float8tensor(p_local):
-                            # Attach FP8 row-wise data in the FP8 parameter
-                            # to slice of the model compute weight bucket.
-                            old_param_data = fp8_get_raw_data(p_local)
-                            assert old_param_data._base is None
-                            new_param_data.detach().copy_(old_param_data)
-                            fp8_set_raw_data(p_local, new_param_data)
-                            del old_param_data
-                            if new_transpose_data is not None:
-                                # Attach FP8 col-wise data in the FP8 parameter
-                                # to slice of the FP8 transpose bucket.
-                                old_transpose_data = fp8_get_raw_data(p_local, True)
-                                assert old_transpose_data._base is None
-                                new_transpose_data.detach().copy_(old_transpose_data)
-                                fp8_set_raw_data(p_local, new_transpose_data, True)
-                                del old_transpose_data
-                        elif isinstance(p, DTensor):
-                            # Same as Tensor case, except for DTensor parameters
-                            # in the original model. Tensor = DTensor.to_local().
-                            old_param_data = p._local_tensor.data
-                            p._local_tensor.data = new_param_data
-                            assert old_param_data._base is None
-                            p._local_tensor.data.detach().copy_(old_param_data)
-                            del old_param_data
-                        else:
-                            # Detach the bucket-allocated parameter data from the computational graph
-                            # before copying the old parameter data into the new parameter data
-                            # to prevent backpropagation into a deleted parameter / Tensor.
+                    if is_float8tensor(p_local):
+                        # Attach FP8 row-wise data in the FP8 parameter
+                        # to slice of the model compute weight bucket.
+                        old_param_data = fp8_get_raw_data(p_local)
+                        assert old_param_data._base is None
+                        new_param_data.detach().copy_(old_param_data)
+                        fp8_set_raw_data(p_local, new_param_data)
+                        del old_param_data
+                        if new_transpose_data is not None:
+                            # Attach FP8 col-wise data in the FP8 parameter
+                            # to slice of the FP8 transpose bucket.
+                            old_transpose_data = fp8_get_raw_data(p_local, True)
+                            assert old_transpose_data._base is None
+                            new_transpose_data.detach().copy_(old_transpose_data)
+                            fp8_set_raw_data(p_local, new_transpose_data, True)
+                            del old_transpose_data
+                    elif isinstance(p, DTensor):
+                        # Same as Tensor case, except for DTensor parameters
+                        # in the original model. Tensor = DTensor.to_local().
+                        old_param_data = p._local_tensor.data
+                        p._local_tensor.data = new_param_data
+                        assert old_param_data._base is None
+                        p._local_tensor.data.detach().copy_(old_param_data)
+                        del old_param_data
+                    else:
+                        # Detach the bucket-allocated parameter data from the computational graph
+                        # before copying the old parameter data into the new parameter data
+                        # to prevent backpropagation into a deleted parameter / Tensor.
 
-                            # Copy the values of the original parameter data into the bucket-allocated
-                            # parameter data. Detach the module parameter because
-                            # parameters that require gradients in the computational
-                            # graph do not support in-place operations.
-                            old_param_data = p.data
-                            p.data = new_param_data
-                            assert old_param_data._base is None
-                            p.data.detach().copy_(old_param_data)
-                            del old_param_data
+                        # Copy the values of the original parameter data into the bucket-allocated
+                        # parameter data. Detach the module parameter because
+                        # parameters that require gradients in the computational
+                        # graph do not support in-place operations.
+                        old_param_data = p.data
+                        p.data = new_param_data
+                        assert old_param_data._base is None
+                        p.data.detach().copy_(old_param_data)
+                        del old_param_data
 
                 # Main Weight (High-Precision) Buffer Initialization
                 if mbuf:
@@ -2745,13 +2792,14 @@ class ParamAndGradBuffer:
                         )
                         mbuf.set_item(item_id, p_local)
 
-                if free_original_param_storage:
-                    assert p.data._base is None
-                    _free_storage(p.data)
-
             if wbuf and wbuf.is_data_distributed:
-                # Free any temporarily allocated full bucket. In the direct DBuffer
-                # initialization path no full bucket was allocated, so this is a no-op.
+                # Free the memory backing the temporarily-allocated bucket associated
+                # with this buffer.
+                # The module parameters will still reference the (now empty) bucket Tensor.
+                # Each rank of the data buffer will persistently store a shard of the module.
+                # This reduces the memory footprint of the model in FSDP, such that the only
+                # time the entire model's weights are allocated in memory is during initialization,
+                # before forward activations and gradients are allocated in training.
                 wbuf.free_bucket_storage()
 
             if tbuf and tbuf.is_data_distributed:
@@ -2759,20 +2807,30 @@ class ParamAndGradBuffer:
 
         # Allocate the main_weight buffer and main_grad buffer data in one buffer.
         if self.buffer_all_in_one:
+            physical_buffer_size = {
+                dtype: self._get_symmetric_alloc_size(size)
+                for dtype, size in buffer_size.items()
+            }
             with self.mem_alloc_context():
                 self.buffer = {
                     torch.float32: torch.empty(
-                        buffer_size[torch.float32], dtype=torch.float32, device=self.device
-                    ),
+                        physical_buffer_size[torch.float32],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )[: buffer_size[torch.float32]],
                     torch.float16: torch.empty(
-                        buffer_size[torch.float16], dtype=torch.float16, device=self.device
-                    ),
+                        physical_buffer_size[torch.float16],
+                        dtype=torch.float16,
+                        device=self.device,
+                    )[: buffer_size[torch.float16]],
                     torch.bfloat16: torch.empty(
-                        buffer_size[torch.bfloat16], dtype=torch.bfloat16, device=self.device
-                    ),
+                        physical_buffer_size[torch.bfloat16],
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )[: buffer_size[torch.bfloat16]],
                     "float8": torch.empty(
-                        buffer_size["float8"], dtype=torch.uint8, device=self.device
-                    ),
+                        physical_buffer_size["float8"], dtype=torch.uint8, device=self.device
+                    )[: buffer_size["float8"]],
                 }
             offset = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
 
@@ -2790,7 +2848,7 @@ class ParamAndGradBuffer:
                 data = self.buffer[dtype][offset[dtype] : offset[dtype] + size]
                 offset[dtype] += size
                 return data
-            return torch.empty(size, dtype=dtype, device=self.device)
+            return self._empty_symmetric_nccl_slice(size, dtype)
 
         # Main Gradient Buffer Initialization
         for group in self.parameter_groups:
@@ -2963,6 +3021,9 @@ class ParamAndGradBuffer:
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=True,
                         force_sync_tp_duplicated_param=True,
+                        ragged_shard=mbuf.dbuffer_plan.item_ragged_shard(item_id)
+                        if sharded_optimizer_state
+                        else None,
                     )
                     dist_main_weight[param_name] = dist_param
                 elif wbuf:
@@ -2976,6 +3037,9 @@ class ParamAndGradBuffer:
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=True,
                         force_sync_tp_duplicated_param=True,
+                        ragged_shard=wbuf.dbuffer_plan.item_ragged_shard(item_id)
+                        if sharded_optimizer_state
+                        else None,
                     )
                     dist_main_weight[param_name] = dist_param
                 else:
@@ -3039,14 +3103,14 @@ class ParamAndGradBuffer:
                     set_param_attribute_closure(dist_param, orig_param),
                 )
                 setattr(dist_param, "orig_param", orig_param)
-                setattr(dist_param, "grove_fsdp_dist_index", self.dist_index)
+                setattr(dist_param, "megatron_fsdp_dist_index", self.dist_index)
 
-                # NOTE: grove_fsdp_slice is used to solve the SwiGLU TP dist-ckpt problem in
+                # NOTE: megatron_fsdp_slice is used to solve the SwiGLU TP dist-ckpt problem in
                 # MCore.
                 mbuf = pg.model_weight_buffer
                 if mbuf:
                     _start, _end = mbuf._get_item_slice_in_shard(item_id)
-                    setattr(dist_param, "grove_fsdp_slice", slice(_start, _end))
+                    setattr(dist_param, "megatron_fsdp_slice", slice(_start, _end))
 
                 dist_param.reset_attribute()
                 named_parameters.append((param_name, dist_param))
@@ -3098,10 +3162,15 @@ class ParamAndGradBuffer:
                     dist_index=self.dist_index,
                     is_sharded_param=sharded_optimizer_state,
                     is_expert_param=group.is_expert_param,
+                    ragged_shard=group.main_grad_buffer.dbuffer_plan.item_ragged_shard(item_id)
+                    if sharded_optimizer_state
+                    else None,
                 )
             else:
                 # Update the existing distributed tensor with the new gradient.
-                if len(orig_param.shape) > 1:
+                if sharded_optimizer_state:
+                    local_shape = (-1,)
+                elif len(orig_param.shape) > 1:
                     local_shape = (-1, *orig_param.shape[1:])
                 else:
                     local_shape = (-1,)
@@ -3801,23 +3870,37 @@ class GradReducePipeline:
                                 (gbuf.data, unreduced_grad)
                             )
                     else:
-                        # Slice a gradient shard from the communication bucket.
-                        grad_shard = gbuf.get_shard_from_bucket(unreduced_grad_bucket)
-
-                        # Execute the reduce-scatter collective.
-                        torch.distributed.reduce_scatter_tensor(
-                            output=grad_shard,
-                            input=unreduced_grad,
-                            op=reduce_op,
-                            group=gbuf.data_parallel_group,
+                        use_inplace_reduce_scatter = (
+                            getattr(ddp_config, "grove_fsdp_inplace_reduce_scatter", True)
+                            and gbuf.is_data_distributed
+                            and not custom_grad_comm_dtype
                         )
+                        if use_inplace_reduce_scatter:
+                            gbuf.dbuffer.reduce_scatter_from(
+                                unreduced_grad,
+                                op=reduce_op,
+                                group=gbuf.data_parallel_group,
+                            )
+                        else:
+                            # Slice a gradient shard from the communication bucket.
+                            grad_shard = gbuf.get_shard_from_bucket(unreduced_grad_bucket)
+
+                            # Execute the reduce-scatter collective.
+                            torch.distributed.reduce_scatter_tensor(
+                                output=grad_shard,
+                                input=unreduced_grad,
+                                op=reduce_op,
+                                group=gbuf.data_parallel_group,
+                            )
 
                         # Track closure tasks to accumulate the reduced gradient shard.
                         # NOTE: If the gradient buffer is unsharded and no communication
                         # bucket is allocated, then the output bucket shard is backed by
                         # the unsharded gradient buffer and the reduce-scatter result
                         # has already been installed into the gradient buffer.
-                        if gbuf.is_data_distributed or custom_grad_comm_dtype:
+                        if (
+                            gbuf.is_data_distributed or custom_grad_comm_dtype
+                        ) and not use_inplace_reduce_scatter:
                             grad_accum_closure.append(
                                 # Target for sharded or un-sharded gradient buffers.
                                 (gbuf.get_shard_from_local_buffer(), grad_shard)
@@ -3826,15 +3909,10 @@ class GradReducePipeline:
                     # Mark bucket ID as CUDA work-in-progress.
                     self.bucket_status[bucket_id] = BucketStatus.COMMUNICATING
 
-            for local_grad, reduced_grad in grad_accum_closure:
-                if ddp_config.data_parallel_sharding_strategy in ["no_shard", "optim"]:
-                    # Copy the reduced gradient into the main gradient buffer.
-                    local_grad.copy_(reduced_grad)
-                else:
-                    # Accumulate the reduced gradient into the local gradient buffer.
-                    # Accumulation data-type is type-promoted with respect to the
-                    # accumulated gradient and the buffer main_grads_dtype.
-                    local_grad += reduced_grad
+            if ddp_config.data_parallel_sharding_strategy in ["no_shard", "optim"]:
+                DistributedBuffer.grouped_copy_(grad_accum_closure)
+            else:
+                DistributedBuffer.grouped_add_tensors_(grad_accum_closure)
 
             # Record a checkpoint for the event to synchronize against the reduce-scatter stream.
             reduce_scatter_view_out_event = reduce_scatter_stream.record_event()
@@ -4239,22 +4317,29 @@ class AllGatherPipeline:
             all_gather_stream.wait_stream(torch.cuda.current_stream())
             dp_group = self.get_fsdp_buffer(buckets[0]).data_parallel_group
             with torch.cuda.stream(all_gather_stream):
-                with _coalescing_manager(
-                    dp_group, async_ops=async_param_gather
-                ) as coalescing_event:
-                    for bucket_id in buckets:
-                        # All-gather the module weights from each FSDP buffer shard
-                        # into an allocated bucket containing unsharded weights.
-                        self.async_bucket_gather(bucket_id, bwd)
+                self.recycle_unused_buckets()
+                if getattr(self.buffer.ddp_config, "grove_fsdp_coalesce_all_gather", True):
+                    with _coalescing_manager(
+                        dp_group, async_ops=async_param_gather
+                    ) as coalescing_event:
+                        for bucket_id in buckets:
+                            # All-gather the module weights from each FSDP buffer shard
+                            # into an allocated bucket containing unsharded weights.
+                            self.async_bucket_gather(
+                                bucket_id, bwd, recycle_unused=False
+                            )
 
-            # Replace the parameter all-gather event with coalescing event.
-            for bucket_id in buckets:
-                bucket_key = self.get_bucket_key(bucket_id, bwd)
-                _, mark_bucket_ready_to_use = self.param_gather_event_map[bucket_key]
-                self.param_gather_event_map[bucket_key] = (
-                    coalescing_event,
-                    mark_bucket_ready_to_use,
-                )
+                    # Replace the parameter all-gather event with coalescing event.
+                    for bucket_id in buckets:
+                        bucket_key = self.get_bucket_key(bucket_id, bwd)
+                        _, mark_bucket_ready_to_use = self.param_gather_event_map[bucket_key]
+                        self.param_gather_event_map[bucket_key] = (
+                            coalescing_event,
+                            mark_bucket_ready_to_use,
+                        )
+                else:
+                    for bucket_id in buckets:
+                        self.async_bucket_gather(bucket_id, bwd, recycle_unused=False)
 
         # Wait for all-gather to finish
         if not async_param_gather:
@@ -4359,7 +4444,7 @@ class AllGatherPipeline:
             return param_group.model_weight_buffer
 
     @torch.no_grad()
-    def async_bucket_gather(self, bucket_id, bwd) -> None:
+    def async_bucket_gather(self, bucket_id, bwd, recycle_unused: bool = True) -> None:
         """All-gather the bucket and set the items."""
         bucket_key = self.get_bucket_key(bucket_id, bwd)
 
@@ -4374,16 +4459,16 @@ class AllGatherPipeline:
         wbuf = self.get_fsdp_buffer(bucket_id, bwd)
 
         # Lazy release the unused buckets.
-        self.recycle_unused_buckets()
+        if recycle_unused:
+            self.recycle_unused_buckets()
 
         # Allocate an empty bucket to store the module weights.
         bucket = wbuf.fetch_bucket(set_param_data=True)
 
         # All-gather the module weights in each buffer shard into the allocated bucket.
         # Now each rank will have a copy of this FSDP unit module's weights.
-        param_gather_event = torch.distributed.all_gather_into_tensor(
-            output_tensor=bucket.data,
-            input_tensor=wbuf.get_shard_from_local_buffer(),
+        param_gather_event = wbuf.dbuffer.all_gather_into(
+            bucket.data,
             group=wbuf.data_parallel_group,
             async_op=True,
         )
@@ -4439,7 +4524,7 @@ def _check_nan_in_grad(grad: torch.Tensor):
     grad_norm = torch.linalg.norm(grad)
     if torch.isnan(grad_norm) or not torch.isfinite(grad_norm):
         raise ValueError(
-            f"[Grove-FSDP](check_for_nan_in_grad=True) Detected NaN or Inf in wgrad: {grad}"
+            f"[Megatron-FSDP](check_for_nan_in_grad=True) Detected NaN or Inf in wgrad: {grad}"
         )
 
 
@@ -4491,7 +4576,7 @@ class ResetParametersContext:
             # is confirmed, because overwrites the quantized_model_init context specified by user.
             assert (
                 HAVE_TE
-            ), "TransformerEngine is required for using FP8 parameters with Grove-FSDP."
+            ), "TransformerEngine is required for using FP8 parameters with Megatron-FSDP."
             # Retrieve import for quantized_model_init (new) or fp8_model_init (old).
             # Will be nullcontext if TE is not installed.
             te_quantized_model_init_cls = get_quantized_model_init_context_cls()
@@ -4502,7 +4587,7 @@ class ResetParametersContext:
                     "preserve_high_precision_init_val"
                     in inspect.signature(te_quantized_model_init_cls).parameters
                 ):
-                    # Required for Grove-FSDP + FP8 parameters.
+                    # Required for Megatron-FSDP + FP8 parameters.
                     args["preserve_high_precision_init_val"] = True
                 self.stack.enter_context(te_quantized_model_init_cls(**args))
 
@@ -4535,7 +4620,7 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
             def override_sharded_param_to_function(*args, **kwargs):
                 if p._typed_storage()._size() == 0:
                     warnings.warn(
-                        "The parameter may be sharded by Grove-FSDP, "
+                        "The parameter may be sharded by Megatron-FSDP, "
                         "no actual 'to' operation is performed."
                     )
                     return torch.empty([])
@@ -4549,7 +4634,7 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
             def override_sharded_param_cpu_function(*args, **kwargs):
                 if p._typed_storage()._size() == 0:
                     warnings.warn(
-                        "The parameter may be sharded by Grove-FSDP, "
+                        "The parameter may be sharded by Megatron-FSDP, "
                         "no actual 'cpu' operation is performed."
                     )
                     return torch.empty([], device="cpu")
@@ -4605,10 +4690,14 @@ def to_local_if_dtensor(tensor):
 
 
 def _get_fsdp_tensor_spec(
-    param, dist_index: FSDPDistributedIndex, is_sharded_param, is_expert_param
+    param,
+    dist_index: FSDPDistributedIndex,
+    is_sharded_param,
+    is_expert_param,
+    ragged_shard: Optional[RaggedShard] = None,
 ):
     """
-    Get the DeviceMesh for the parameter and modify the placement for Grove-FSDP.
+    Get the DeviceMesh for the parameter and modify the placement for Megatron-FSDP.
     """
     # Check if the parameter is a DTensor and has more than one shard (TP enabled).
     if isinstance(param, DTensor) and cast(DTensor, param)._spec.num_shards > 1:
@@ -4617,7 +4706,7 @@ def _get_fsdp_tensor_spec(
 
         # Get the placements for the parameter.
         assert len(dtensor_spec.placements) == 1, (
-            "When using DTensor with Grove-FSDP, the DTensorSpec should have only one placement."
+            "When using DTensor with Megatron-FSDP, the DTensorSpec should have only one placement."
             f"Current placements: {dtensor_spec.placements}"
         )
         dtensor_placement = dtensor_spec.placements[0]
@@ -4663,6 +4752,8 @@ def _get_fsdp_tensor_spec(
 
     if not is_sharded_param:
         placements = [Replicate()]
+    elif ragged_shard is not None and not dist_index.use_hybrid_fsdp:
+        placements = [ragged_shard]
     elif dist_index.use_hybrid_fsdp:
         # If the parameter is sharded in hybrid FSDP, we need to add the HS-DP dimension.
         if dist_index.hsdp_outer_dp_shard:
@@ -4689,10 +4780,11 @@ def make_fsdp_dtensor(
     run_check: bool = False,
     update_uneven_dtensor_chunk_meta: bool = False,
     force_sync_tp_duplicated_param: bool = False,
+    ragged_shard: Optional[RaggedShard] = None,
 ):
     """
     Creates a distributed tensor (DTensor) from a local tensor with support for
-    Grove-FSDP and Tensor Parallel scenarios.
+    Megatron-FSDP and Tensor Parallel scenarios.
 
     This function is typically used in a FSDP setup where tensor data needs to be converted
     into sharded DTensors across a device mesh. It also supports model configurations
@@ -4758,7 +4850,7 @@ def make_fsdp_dtensor(
     # TODO: Add validation checks for the legality of DTensor.
     if not is_sharded_param and param.numel() != local_tensor.numel():
         raise ValueError(
-            f"[Grove-FSDP] Mismatch between param shape {param.shape} and local tensor "
+            f"[Megatron-FSDP] Mismatch between param shape {param.shape} and local tensor "
             f"shape {local_tensor.shape}. "
             "If the parameter is not sharded, they must match exactly."
         )
@@ -4772,11 +4864,11 @@ def make_fsdp_dtensor(
     ):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
-            "[Grove-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
+            "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
         )
         # Verify a DeviceMesh TP dimension exists.
         assert dist_index.tp_dim is not None, (
-            "[Grove-FSDP] TP dimension is missing from DeviceMesh / FSDPDistributedIndex! "
+            "[Megatron-FSDP] TP dimension is missing from DeviceMesh / FSDPDistributedIndex! "
             "Required for Megatron-Core or TransformerEngine modules that use TP. "
             "If TP=1, a trivial TP dimension of size 1 should be provided."
         )
@@ -4795,7 +4887,7 @@ def make_fsdp_dtensor(
         else:
             tp_dim = get_mcore_tensor_parallel_partition_dim(param)
             assert tp_dim is not None, (
-                "[Grove-FSDP] Parameter is not tensor model parallel, "
+                "[Megatron-FSDP] Parameter is not tensor model parallel, "
                 "yet tensor_model_parallel is True."
             )
             placements = [Shard(tp_dim)]
@@ -4813,11 +4905,17 @@ def make_fsdp_dtensor(
 
     # Get FSDP-configured mesh and placements from provided param
     device_mesh, placements = _get_fsdp_tensor_spec(
-        param, dist_index, is_sharded_param=is_sharded_param, is_expert_param=is_expert_param
+        param,
+        dist_index,
+        is_sharded_param=is_sharded_param,
+        is_expert_param=is_expert_param,
+        ragged_shard=ragged_shard,
     )
 
-    # Reshape local tensor for sharded layouts beyond 1D
-    if len(orig_param.shape) > 1:
+    # RaggedShard local tensors are intentionally flat and may split rows.
+    if ragged_shard is not None and is_sharded_param:
+        local_shape = (-1,)
+    elif len(orig_param.shape) > 1:
         local_shape = (-1, *orig_param.shape[1:])
     else:
         local_shape = (-1,)
