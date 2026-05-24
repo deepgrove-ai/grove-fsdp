@@ -1,0 +1,72 @@
+// Run
+//
+// python -m grpc_tools.protoc -I.  --python_out=. --pyi_out=. \
+// --grpc_python_out=. ./checkpoint/utilities/server/mem_file_service.proto
+//
+// to generate new protos.
+
+syntax = "proto3";
+
+message VeScaleCheckpointWriteRequest {
+  bytes content = 1;
+
+  string name = 8;
+}
+
+message VeScaleCheckpointWriteResponse {
+}
+
+message VeScaleCheckpointReadRequest {
+  string name = 1;
+}
+
+message VeScaleCheckpointReadResponse {
+  bytes content = 1;
+}
+
+message VeScaleCheckpointRenameRequest {
+  string src = 1;
+  string dst = 2;
+  bool overwrite = 3;
+}
+
+message VeScaleCheckpointRenameResponse {
+}
+
+message VeScaleCheckpointRemoveRequest {
+  string name = 1;
+}
+
+message VeScaleCheckpointRemoveResponse {
+}
+
+message VeScaleCheckpointListdirRequest {
+  string name = 1;
+}
+
+message VeScaleCheckpointListdirResponse {
+  repeated string names = 1;
+}
+
+message VeScaleCheckpointExistsRequest {
+  string name = 1;
+}
+
+message VeScaleCheckpointExistsResponse {
+  bool exists = 1;
+}
+
+service VeScaleCheckpointMemFileService {
+  rpc Write(stream VeScaleCheckpointWriteRequest) returns (VeScaleCheckpointWriteResponse) {
+  }
+  rpc Read(VeScaleCheckpointReadRequest) returns (stream VeScaleCheckpointReadResponse) {
+  }
+  rpc Rename(VeScaleCheckpointRenameRequest) returns (VeScaleCheckpointRenameResponse) {
+  }
+  rpc Remove(VeScaleCheckpointRemoveRequest) returns (VeScaleCheckpointRemoveResponse) {
+  }
+  rpc Listdir(VeScaleCheckpointListdirRequest) returns (VeScaleCheckpointListdirResponse) {
+  }
+  rpc Exists(VeScaleCheckpointExistsRequest) returns (VeScaleCheckpointExistsResponse) {
+  }
+}

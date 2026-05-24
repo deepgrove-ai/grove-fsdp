@@ -1,0 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.7.1
+expecttest
+hypothesis
+pytest
+numpy<2.0.0
