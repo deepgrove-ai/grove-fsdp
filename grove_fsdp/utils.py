@@ -777,7 +777,14 @@ class GlobalMemoryBuffer:
     def __init__(self):
         self.buffer = {}
 
-    def get_tensor(self, tensor_shape, dtype, name, mem_alloc_context: Optional[Callable] = None):
+    def get_tensor(
+        self,
+        tensor_shape,
+        dtype,
+        name,
+        mem_alloc_context: Optional[Callable] = None,
+        device=None,
+    ):
         """
         Returns (potentially) a sub-tensor from the self.buffer for the given shape.
         """
@@ -788,14 +795,20 @@ class GlobalMemoryBuffer:
         ):
             mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
             with mem_alloc_context():
+                if device is None:
+                    device = torch.cuda.current_device()
                 self.buffer[(name, dtype)] = torch.empty(
                     required_len,
                     dtype=dtype,
-                    device=torch.cuda.current_device(),
+                    device=device,
                     requires_grad=False,
                 )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+    def clear(self):
+        """Drop all cached global-memory tensors."""
+        self.buffer.clear()
 
 
 def get_global_memory_buffer():

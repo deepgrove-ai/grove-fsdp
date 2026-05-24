@@ -345,6 +345,27 @@ class GroveFSDP(torch.nn.Module):
             # Attach GroveFSDP reference to the parameter.
             setattr(param, "_grove_fsdp_model", self)
 
+    def __getattr__(self, name: str) -> Any:
+        """Delegate unknown attributes to the wrapped module.
+
+        This mirrors common FSDP wrapper ergonomics for module-owned metadata
+        such as Hugging Face `config`, while preserving normal `nn.Module`
+        lookup for GroveFSDP attributes, parameters, buffers, and submodules.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError as exc:
+            if name == "module":
+                raise exc
+            try:
+                module = super().__getattr__("module")
+            except AttributeError:
+                raise exc
+            try:
+                return getattr(module, name)
+            except AttributeError:
+                raise exc
+
     def _check_module_parameter_types(self):
         """
         Check if the module parameters include special parameters
@@ -419,17 +440,22 @@ class GroveFSDP(torch.nn.Module):
                     if isinstance(module, tuple(self.fsdp_unit_modules)):
                         total_fsdp_module += 1
                         total_param_elements += sum(p.numel() for p in module.parameters())
-                # The suggested size is twice the number of elements in the FSDP modules.
-                # This ensures we process the current FSDP module and attempt to prefetch
-                # the next FSDP module, making the flow of communication better.
-                suggested_communication_unit_size = total_param_elements // total_fsdp_module * 2
+                if total_fsdp_module > 0:
+                    # The suggested size is twice the average number of elements in the
+                    # FSDP modules. This processes the current FSDP module and attempts
+                    # to prefetch the next one without retaining many layers at once.
+                    suggested_communication_unit_size = (
+                        total_param_elements // total_fsdp_module * 2
+                    )
+                else:
+                    suggested_communication_unit_size = 1_000_000_000
             elif self.bucket_size is not None:
                 suggested_communication_unit_size = self.bucket_size
             else:
                 suggested_communication_unit_size = 1_000_000_000
 
             # Cap to 1B elements.
-            suggested_communication_unit_size = max(
+            suggested_communication_unit_size = min(
                 1_000_000_000, suggested_communication_unit_size
             )
 

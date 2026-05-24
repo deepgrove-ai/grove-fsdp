@@ -1,3 +1,5 @@
+import torch
+
 from grove_fsdp import GroveFSDP, fully_shard_model
 from grove_fsdp.dbuffer import RaggedShard
 from grove_fsdp.distributed_data_parallel_config import DistributedDataParallelConfig
@@ -16,3 +18,19 @@ def test_ragged_shard_placement_flags() -> None:
     assert not placement.is_shard()
     assert not placement.is_partial()
 
+
+def test_grove_fsdp_delegates_unknown_attributes_to_wrapped_module() -> None:
+    class ModuleWithMetadata(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2)
+            self.config = {"hidden_size": 2}
+
+    wrapped = ModuleWithMetadata()
+    fsdp = GroveFSDP.__new__(GroveFSDP)
+    torch.nn.Module.__init__(fsdp)
+    fsdp.module = wrapped
+
+    assert fsdp.config == {"hidden_size": 2}
+    assert fsdp.linear is wrapped.linear
+    assert fsdp.module is wrapped

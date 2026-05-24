@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -172,8 +172,42 @@ class DistributedDataParallelConfig:
 
     grove_fsdp_ragged_shard_block_size: Optional[int] = None
     """Optional contiguous element block size for RaggedShard layout planning.
-      When unset, Grove-FSDP derives a row-wise block size from each parameter shape
-      and the existing chunk-size factor used by the communication layout.
+      When unset, Grove-FSDP defaults to row-wise blocks for tensors with rank
+      greater than one, and element-wise blocks for rank-zero/rank-one tensors.
+      This option is ignored when `grove_fsdp_ragged_shard_block_size_fn` is set.
+    """
+
+    grove_fsdp_ragged_shard_block_size_fn: Optional[Callable[[torch.Size], int]] = None
+    """Optional shape-aware block-size function for RaggedShard layout planning.
+      This should return the contiguous element block size for each tensor shape.
+      Use this for per-tensor quantization or layout constraints that cannot be
+      represented by one global `grove_fsdp_ragged_shard_block_size`.
+      This option is ignored when `grove_fsdp_ragged_shard_param_block_size_fn`
+      is set.
+    """
+
+    grove_fsdp_ragged_shard_param_block_size_fn: Optional[
+        Callable[[torch.nn.Parameter], int]
+    ] = None
+    """Optional per-parameter block-size function for RaggedShard layout planning.
+      This should return the contiguous element block size for each sharded
+      parameter. Use this when tensors with the same shape can still have
+      different block constraints.
+    """
+
+    grove_fsdp_align_dbuffer_to_chunk_size: bool = False
+    """If true, require DBuffer per-rank shard sizes to align to the existing
+      communication chunk-size factor. The default keeps chunking separate from
+      RaggedShard layout planning to reduce row-wise padding overhead.
+    """
+
+    grove_fsdp_dbuffer_workspace_size: int = 0
+    """Initial target number of reusable full-bucket DBuffer workspaces for
+      temporary all-gather and reduce-scatter communication buffers when fixed-pool
+      double buffering is not otherwise enabled. The pool may grow if overlap or
+      prefetch produces higher live concurrency, so it is opt-in by default.
+      A value of 0 disables this workspace pool and falls back to storage-resize
+      allocation.
     """
 
     def __post_init__(self):

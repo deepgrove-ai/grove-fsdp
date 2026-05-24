@@ -95,6 +95,7 @@ def fully_shard_model(
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
     use_decoupled_grad: bool = False,
+    grove_fsdp_dbuffer_workspace_size: int = 0,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Grove-FSDP. This wraps the model in a GroveFSDP
@@ -256,6 +257,10 @@ def fully_shard_model(
             If true, reduced gradients are installed into `Parameter.decoupled_grad` instead
             of `Parameter.grad`. Defaults to False.
 
+        grove_fsdp_dbuffer_workspace_size (int):
+            Opt-in reusable DBuffer workspace pool size for temporary communication
+            buckets. Defaults to 0, which keeps the storage-resize path.
+
     Returns:
         model (GroveFSDP): The wrapped Grove-FSDP model configured for FSDP.
     """
@@ -351,6 +356,7 @@ def fully_shard_model(
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
         grove_fsdp_use_decoupled_grad=use_decoupled_grad,
+        grove_fsdp_dbuffer_workspace_size=grove_fsdp_dbuffer_workspace_size,
     )
 
     # Create FSDPDistributedIndex.

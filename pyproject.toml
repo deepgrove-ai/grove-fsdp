@@ -8,7 +8,8 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["grove_fsdp", "grove_fsdp.*"]
+where = [".", "veScale"]
+include = ["grove_fsdp", "grove_fsdp.*", "vescale", "vescale.*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "grove_fsdp.package_info.__version__" }
@@ -64,7 +65,7 @@ test = ["pytest"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "veScale"]
 
 
 [tool.uv]

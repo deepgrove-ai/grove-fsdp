@@ -20,8 +20,6 @@ __version__ = "0.3.4a0"
 __branch__ = None
 __commit_id__ = None
 
-print(f"vescale version is {__version__}")
-
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from vescale.dtensor import DTensor
 from vescale.dtensor.placement_types import (

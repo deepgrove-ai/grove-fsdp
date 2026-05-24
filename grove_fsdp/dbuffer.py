@@ -14,334 +14,32 @@
 
 """RaggedShard layout planning and DBuffer metadata for Grove-FSDP.
 
-The ``RaggedShard`` placement is adapted from veScale's open-source
-implementation. Grove-FSDP still communicates flat DBuffer buckets today,
-but the placement itself can split, scatter, gather, and reshard uneven flat
-tensors for callers that need a real DTensor-like placement object.
+Grove-FSDP uses the vendored veScale RaggedShard placement implementation.
+This module owns only the Grove DBuffer planning metadata that consumes that
+placement.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import math
+from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.distributed_c10d import ProcessGroup, get_global_rank
-from torch.distributed.tensor.placement_types import Placement, Replicate
+from vescale.dtensor.placement_types import (
+    RaggedShard,
+    _StridedRaggedShard,
+    is_ragged_shard,
+)
+from vescale.dtensor.vescale_utils.ragged_shard_utils import (
+    flatten_index,
+    get_ragged_shard,
+    substitute_ragged_with_replicate,
+    unravel_index,
+)
 
 
-def is_ragged_shard(placement: Placement) -> bool:
-    """Return true if ``placement`` is a Grove-FSDP RaggedShard."""
-    return isinstance(placement, RaggedShard)
-
-
-if not hasattr(Placement, "is_ragged_shard"):
-    Placement.is_ragged_shard = is_ragged_shard  # type: ignore[attr-defined]
-
-
-def mesh_scatter_ragged(
-    output: torch.Tensor,
-    scatter_list: List[torch.Tensor],
-    mesh: DeviceMesh,
-    mesh_dim: int = 0,
-    *,
-    group_src: int = 0,
-) -> None:
-    """Scatter uneven tensor shards across a DeviceMesh dimension.
-
-    PyTorch's public scatter utilities expect even output sizes. This mirrors
-    veScale's send/recv based implementation for ragged tensors and only relies
-    on APIs available in PyTorch 2.9.1.
-    """
-    if output.is_meta:
-        return
-
-    dim_group = mesh.get_group(mesh_dim)
-    if not isinstance(dim_group, ProcessGroup):
-        raise TypeError(f"Expected ProcessGroup for mesh dim {mesh_dim}, got {type(dim_group)}")
-
-    group_rank = torch.distributed.get_rank(dim_group)
-    if group_src == group_rank:
-        for rank, shard in enumerate(scatter_list):
-            if rank == group_src:
-                continue
-            torch.distributed.send(shard.contiguous(), dst=get_global_rank(dim_group, rank))
-        output.copy_(scatter_list[group_src])
-    else:
-        torch.distributed.recv(output, src=get_global_rank(dim_group, group_src))
-
-
-def unravel_index(index: int, shape: Tuple[int, ...]) -> List[int]:
-    """Convert a flat row-major index into coordinates."""
-    coords = [0] * len(shape)
-    for dim in range(len(shape) - 1, -1, -1):
-        coords[dim] = index % shape[dim]
-        index //= shape[dim]
-    return coords
-
-
-def flatten_index(index: Tuple[int, ...], shape: Tuple[int, ...]) -> int:
-    """Convert row-major coordinates into a flat index."""
-    if len(shape) != len(index):
-        raise ValueError(f"Shape length {len(shape)} and index length {len(index)} must match")
-
-    flat_index = 0
-    stride = 1
-    for size, coord in zip(reversed(shape), reversed(index)):
-        if not 0 <= coord < size:
-            raise IndexError(f"Index {coord} out of bounds for dimension size {size}")
-        flat_index += coord * stride
-        stride *= size
-    return flat_index
-
-
-def get_ragged_shard(placements: Iterable[Placement]) -> Tuple[int, RaggedShard]:
-    """Return the single RaggedShard placement and its mesh-dimension index."""
-    ragged_placement = None
-    ragged_placement_idx = None
-    n_other_placements = 0
-    placements_tuple = tuple(placements)
-    for idx, placement in enumerate(placements_tuple):
-        if isinstance(placement, RaggedShard):
-            if ragged_placement is not None:
-                raise RuntimeError("Only one RaggedShard placement is supported")
-            if n_other_placements != 0:
-                raise RuntimeError(f"RaggedShard must appear before non-replicate placements: {placements_tuple}")
-            ragged_placement = placement
-            ragged_placement_idx = idx
-            continue
-        if isinstance(placement, Replicate):
-            continue
-        n_other_placements += 1
-
-    if ragged_placement is None or ragged_placement_idx is None:
-        raise RuntimeError(f"No RaggedShard placement found in {placements_tuple}")
-    return ragged_placement_idx, ragged_placement
-
-
-def substitute_ragged_with_replicate(placements: Iterable[Placement]) -> Tuple[Placement, ...]:
-    """Replace the RaggedShard placement with Replicate."""
-    placements_tuple = tuple(placements)
-    idx, _ = get_ragged_shard(placements_tuple)
-    return (*placements_tuple[:idx], Replicate(), *placements_tuple[idx + 1 :])
-
-
-@dataclasses.dataclass(frozen=True)
-class RaggedShard(Placement):
-    """A ragged DTensor placement over contiguous flattened tensor storage.
-
-    Args:
-        dims: Prefix tensor dimensions represented by the flattened ragged shard.
-            For ``shape=(n, m, k)`` and ``dims=(0,)``, each local flat tensor is
-            reconstructable as ``(-1, m, k)``.
-        local_units: Relative per-rank allocation. The tuple length must equal
-            ``mesh.size(mesh_dim)`` when used with a device mesh.
-
-    Notes:
-        This is intentionally scoped to the veScale RaggedShard core that is
-        compatible with PyTorch 2.9.1 placement APIs. It does not install
-        veScale's broader DTensor dispatch/redistribute monkey patches.
-    """
-
-    dims: Tuple[int, ...]
-    local_units: Tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if len(self.dims) == 0:
-            raise ValueError("RaggedShard dims must be non-empty")
-        if self.dims != tuple(range(len(self.dims))):
-            raise ValueError(f"RaggedShard only supports prefix dims, got {self.dims}")
-        if len(self.local_units) == 0:
-            raise ValueError("RaggedShard local_units must be non-empty")
-        if any(unit < 0 for unit in self.local_units):
-            raise ValueError(f"RaggedShard local_units must be non-negative, got {self.local_units}")
-        if sum(self.local_units) <= 0:
-            raise ValueError(f"RaggedShard local_units must sum to a positive value, got {self.local_units}")
-
-    def is_ragged_shard(self) -> bool:
-        """Return true for compatibility with veScale placement checks."""
-        return True
-
-    def is_replicate(self) -> bool:
-        """Override PyTorch's Placement method for pybind-subclass safety."""
-        return False
-
-    def is_shard(self, dim: Optional[int] = None) -> bool:
-        """Override PyTorch's Placement method for pybind-subclass safety."""
-        return False
-
-    def is_partial(self) -> bool:
-        """Override PyTorch's Placement method for pybind-subclass safety."""
-        return False
-
-    def _split_tensor(self, tensor: torch.Tensor, num_chunks: int) -> List[torch.Tensor]:
-        """Split a contiguous tensor into uneven flat shards."""
-        if not tensor.is_contiguous():
-            raise ValueError("RaggedShard expects a contiguous tensor")
-        if num_chunks != len(self.local_units):
-            raise ValueError(
-                f"num_chunks ({num_chunks}) must equal len(local_units) ({len(self.local_units)})"
-            )
-
-        total_units = sum(self.local_units)
-        total_numel = tensor.numel()
-        if total_numel % total_units != 0:
-            raise ValueError(
-                f"tensor.numel() ({total_numel}) must be divisible by sum(local_units) ({total_units})"
-            )
-
-        unit_numel = total_numel // total_units
-        flat_tensor = tensor.view(-1)
-        start_idx = 0
-        shard_list = []
-        for local_unit in self.local_units:
-            shard_len = local_unit * unit_numel
-            shard_list.append(flat_tensor.narrow(0, start_idx, shard_len))
-            start_idx += shard_len
-        return shard_list
-
-    def _ragged_shard_tensor(
-        self,
-        tensor: torch.Tensor,
-        mesh: DeviceMesh,
-        mesh_dim: int,
-        src_data_rank: int | None = 0,
-    ) -> torch.Tensor:
-        """Shard and scatter a tensor over ``mesh_dim`` using ragged sizes."""
-        my_coordinate = mesh.get_coordinate()
-        if my_coordinate is None:
-            return tensor.new_empty(0, requires_grad=tensor.requires_grad)
-
-        num_chunks = mesh.size(mesh_dim=mesh_dim)
-        if len(self.local_units) != num_chunks:
-            raise ValueError(
-                f"len(local_units) ({len(self.local_units)}) must equal mesh dim size ({num_chunks})"
-            )
-
-        mesh_dim_local_rank = my_coordinate[mesh_dim]
-        scatter_list = self._split_tensor(tensor, num_chunks)
-        if src_data_rank is None:
-            return scatter_list[mesh_dim_local_rank]
-
-        output = torch.empty_like(scatter_list[mesh_dim_local_rank])
-        mesh_scatter_ragged(
-            output,
-            scatter_list,
-            mesh,
-            mesh_dim=mesh_dim,
-            group_src=src_data_rank,
-        )
-        return output
-
-    def _to_replicate_tensor(
-        self,
-        local_tensor: torch.Tensor,
-        mesh: DeviceMesh,
-        mesh_dim: int,
-        current_logical_shape: Iterable[int],
-    ) -> torch.Tensor:
-        """Gather ragged local shards into a replicated flat tensor."""
-        logical_numel = math.prod(tuple(current_logical_shape))
-        total_units = sum(self.local_units)
-        if logical_numel % total_units != 0:
-            raise ValueError(
-                f"logical numel ({logical_numel}) must be divisible by sum(local_units) ({total_units})"
-            )
-
-        unit_numel = logical_numel // total_units
-        tensor_list = [
-            torch.empty(
-                unit_numel * self.local_units[rank],
-                dtype=local_tensor.dtype,
-                device=local_tensor.device,
-            )
-            for rank in range(mesh.size(mesh_dim))
-        ]
-        torch.distributed.all_gather(tensor_list, local_tensor.contiguous(), group=mesh.get_group(mesh_dim))
-        return torch.cat(tensor_list)
-
-    def _to_new_ragged_shard(
-        self,
-        local_tensor: torch.Tensor,
-        mesh: DeviceMesh,
-        mesh_dim: int,
-        current_logical_shape: Iterable[int],
-        new_local_units: Tuple[int, ...],
-    ) -> torch.Tensor:
-        """Redistribute from this ragged layout to another local-unit layout."""
-        numel = math.prod(tuple(current_logical_shape))
-        src_total_units = sum(self.local_units)
-        dst_total_units = sum(new_local_units)
-        if numel % src_total_units != 0 or numel % dst_total_units != 0:
-            raise ValueError(
-                "current_logical_shape numel must be divisible by both old and new local units"
-            )
-
-        src_slices = tuple(unit * (numel // src_total_units) for unit in self.local_units)
-        dst_slices = tuple(unit * (numel // dst_total_units) for unit in new_local_units)
-        coord = mesh.get_coordinate()
-        if coord is None:
-            return local_tensor.new_empty(0)
-        rank = coord[mesh_dim]
-
-        input_tensor_list = []
-        src_left = sum(src_slices[:rank])
-        src_right = src_left + src_slices[rank]
-        for dst_rank in range(len(new_local_units)):
-            dst_left = sum(dst_slices[:dst_rank])
-            dst_right = dst_left + dst_slices[dst_rank]
-            if dst_right <= src_left or dst_left >= src_right:
-                input_tensor_list.append(torch.empty(0, dtype=local_tensor.dtype, device=local_tensor.device))
-            else:
-                start = max(dst_left, src_left)
-                end = min(dst_right, src_right)
-                input_tensor_list.append(local_tensor.narrow(0, start - src_left, end - start))
-
-        output_tensor_list = []
-        dst_left = sum(dst_slices[:rank])
-        dst_right = dst_left + dst_slices[rank]
-        for src_rank in range(len(self.local_units)):
-            src_left = sum(src_slices[:src_rank])
-            src_right = src_left + src_slices[src_rank]
-            length = max(0, min(src_right, dst_right) - max(src_left, dst_left))
-            output_tensor_list.append(torch.empty(length, dtype=local_tensor.dtype, device=local_tensor.device))
-
-        torch.distributed.all_to_all(
-            output_tensor_list,
-            input_tensor_list,
-            group=mesh.get_group(mesh_dim),
-        )
-        return torch.cat(output_tensor_list)
-
-    def reconstruct_tensor_from_flat(self, flat_tensor: torch.Tensor, shape: Tuple[int, ...]) -> torch.Tensor:
-        """Recover a local unflattened tensor view from a flat ragged shard."""
-        if flat_tensor.ndim != 1:
-            raise ValueError("flat_tensor must be 1-dimensional")
-        ndim = len(self.dims)
-        suffix_numel = math.prod(shape[ndim:]) if ndim < len(shape) else 1
-        if flat_tensor.numel() % suffix_numel != 0:
-            raise ValueError(
-                f"flat_tensor.numel() ({flat_tensor.numel()}) must be divisible by suffix numel ({suffix_numel})"
-            )
-        return flat_tensor.view(-1, *shape[ndim:])
-
-    def __repr__(self) -> str:
-        return f"RaggedShard(dims={self.dims}, local_units={self.local_units})"
-
-    def __str__(self) -> str:
-        return repr(self)
-
-
-@dataclasses.dataclass(frozen=True)
-class _StridedRaggedShard(RaggedShard):
-    """RaggedShard analogue of PyTorch's private _StridedShard metadata."""
-
-    split_factor: int
-
-
-@dataclasses.dataclass(frozen=True)
+@dataclass(frozen=True)
 class DBufferItem:
     """One tensor's planned location in a distributed buffer."""
 
@@ -352,7 +50,7 @@ class DBufferItem:
     block_size: int
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclass(frozen=True)
 class DBufferShard:
     """The local shard view of a global DBuffer bucket."""
 
@@ -363,7 +61,7 @@ class DBufferShard:
     size: int
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclass(frozen=True)
 class DBufferPlan:
     """Planned logical layout for one FSDP communication bucket."""
 
@@ -597,6 +295,8 @@ def plan_dbuffer_layout(
     chunk_size_factor: int,
     pad_bucket: bool,
     item_block_size_fn: Optional[Callable[[torch.Size], int]] = None,
+    item_block_sizes: Optional[Iterable[int]] = None,
+    align_bucket_to_chunk_size: bool = False,
     preserve_item_order: bool = False,
 ) -> DBufferPlan:
     """Plan a RaggedShard-compatible DBuffer layout.
@@ -610,6 +310,12 @@ def plan_dbuffer_layout(
         chunk_size_factor: Existing Grove-FSDP communication segmentation unit.
         pad_bucket: Whether the bucket must be padded to shard evenly.
         item_block_size_fn: Optional per-shape block-size override.
+        item_block_sizes: Optional per-item block sizes. Mutually exclusive with
+            item_block_size_fn.
+        align_bucket_to_chunk_size: If true, require each per-rank shard size
+            to be a multiple of chunk_size_factor. The default keeps
+            communication chunking separate from DBuffer layout planning, which
+            reduces padding for mixed row sizes.
         preserve_item_order: If true, keeps the legacy compact-in-order layout
             instead of running the RaggedShard planner.
 
@@ -617,14 +323,25 @@ def plan_dbuffer_layout(
         A DBufferPlan that can be translated into the existing bucket index types.
     """
 
-    collective_unit_size = max(1, chunk_size_factor)
+    collective_unit_size = max(1, chunk_size_factor) if align_bucket_to_chunk_size else 1
     shard_quantum = data_parallel_world_size * collective_unit_size
+    if item_block_size_fn is not None and item_block_sizes is not None:
+        raise ValueError("Only one of item_block_size_fn and item_block_sizes may be set")
     item_block_size_fn = item_block_size_fn or (
-        lambda shape: _default_item_block_size(shape, chunk_size_factor)
+        lambda shape: _default_item_block_size(shape, None)
     )
+    shapes = [torch.Size(shape) for shape in elements]
+    if item_block_sizes is None:
+        block_sizes = [item_block_size_fn(shape) for shape in shapes]
+    else:
+        block_sizes = list(item_block_sizes)
+        if len(block_sizes) != len(shapes):
+            raise ValueError(
+                f"item_block_sizes has {len(block_sizes)} entries, expected {len(shapes)}"
+            )
     items = [
-        (item_id, torch.Size(shape), max(1, item_block_size_fn(torch.Size(shape))))
-        for item_id, shape in enumerate(elements)
+        (item_id, shape, max(1, int(block_size)))
+        for item_id, (shape, block_size) in enumerate(zip(shapes, block_sizes))
     ]
 
     if preserve_item_order:
