@@ -9,7 +9,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 pushd "$SCRIPT_DIR"/..
 
 # install vescale
-pip3 install -r requirements.txt --cache-dir "${HOME}"/.cache/pip && pip3 install -e .
+#pip3 install -r requirements.txt --cache-dir "${HOME}"/.cache/pip && pip3 install -e .
 
 # jump to test folder
 pushd test/

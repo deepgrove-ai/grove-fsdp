@@ -78,5 +78,5 @@ setup(
         "vescale": package_files(["vescale"]),
     },
     install_requires=required,
-    python_requires=">=3.11",
+    python_requires=">=3.10",
 )

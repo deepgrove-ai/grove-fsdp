@@ -7,13 +7,16 @@
 ################################################################################
 # Modification Copyright 2023 ByteDance Ltd. and/or its affiliates.
 ################################################################################
+import contextlib
 import logging
 from typing import cast, Tuple, Dict
 
 import torch
 import torch.distributed as dist
+import torch.distributed.tensor._random as random
 from torch.distributed.tensor._dispatch import OpDispatcher as TorchOpDispatcher
 from torch.distributed.tensor import DTensor as TorchDTensor
+from torch.distributed.tensor._random import is_rng_supported_mesh
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from vescale.dtensor._dtensor_spec import DTensorSpec, TensorMeta
 from vescale.dtensor._op_schema import (
@@ -336,13 +339,89 @@ class OpDispatcher(TorchOpDispatcher):
         if op_call in self._custom_op_handlers:
             return self._custom_op_handlers[op_call](op_call, args, kwargs)
 
-        self.sharding_propagator.propagate(op_info)
+        try:
+            self.sharding_propagator.propagate(op_info)
+        except NotImplementedError:
+            if torch._C._dispatch_has_kernel_for_dispatch_key(
+                op_call.name(), torch._C.DispatchKey.CompositeImplicitAutograd
+            ):
+                out = op_call.decompose(*args, **kwargs)
+                assert out is not NotImplemented
+                return out
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Sharding propagation failed for {op_info.schema}") from e
         assert op_info.output_sharding is not None
         output_sharding = op_info.output_sharding
 
-        local_results = self._dispatch_get_local_results_slow_path(op_call, args, op_info)
         compute_mesh = op_info.compute_mesh
-        participating = compute_mesh._is_current_rank_part_of_mesh()
+        participating = compute_mesh.get_coordinate() is not None
+
+        if participating:
+            if output_sharding.needs_redistribute:
+                assert output_sharding.redistribute_schema is not None
+                self.redistribute_local_args(
+                    op_info,
+                    output_sharding.redistribute_schema,
+                    output_sharding.use_val_from_redistribute_schema,
+                )
+
+            local_tensor_args = (
+                pytree.tree_unflatten(
+                    cast(list[object], op_info.local_args),
+                    op_info.args_tree_spec,
+                )
+                if op_info.args_tree_spec
+                else op_info.local_args
+            )
+            local_tensor_args = cast(tuple[object, ...], local_tensor_args)
+            if op_call in self._random_ops:
+                if not random._rng_tracker and is_rng_supported_mesh(compute_mesh):
+                    random._rng_tracker = random.OffsetBasedRNGTracker(compute_mesh)
+
+                first_arg = cast(dtensor.DTensor, args[0])
+                first_local_arg = cast(torch.Tensor, local_tensor_args[0])
+                maybe_user_generator = op_info.local_kwargs.pop("generator", None)
+                assert maybe_user_generator is None or isinstance(
+                    maybe_user_generator,
+                    torch.Generator,
+                )
+                rng_context = (
+                    random._rng_tracker._distribute_region(first_arg._spec, generator=maybe_user_generator)
+                    if random._rng_tracker and not first_local_arg.is_meta
+                    else contextlib.nullcontext()
+                )
+                with rng_context:
+                    local_results = op_call(*local_tensor_args, **op_info.local_kwargs)
+            else:
+                local_results = op_call(*local_tensor_args, **op_info.local_kwargs)
+        else:
+            spec = output_sharding.output_spec
+            ret_list = op_info.schema.op._schema.returns
+
+            if spec is None:
+                local_results = None
+            else:
+
+                def default_tensor(spec: DTensorSpec) -> torch.Tensor:
+                    if spec.tensor_meta is None:
+                        raise RuntimeError(f"{spec} has no tensor metadata.")
+                    shape = spec.tensor_meta.shape
+                    dtype = spec.tensor_meta.dtype
+                    if len(shape) == 0:
+                        return torch.zeros((), dtype=dtype)
+                    return torch.tensor([], dtype=dtype)
+
+                if isinstance(spec, DTensorSpec):
+                    local_results = default_tensor(spec)
+                elif isinstance(spec, (list, tuple)):
+                    local_results = [default_tensor(s) if s is not None else None for s in spec]
+                    assert isinstance(local_results, list)
+                    if None in local_results:
+                        ret_type = str(ret_list[0].type)
+                        raise NotImplementedError(f"return type {ret_type} in DTensor op is not supported")
+                else:
+                    raise RuntimeError(f"Unsupported output spec: {spec}")
 
         if output_sharding.output_spec is None:
             if op_call == aten.equal.default:
@@ -360,7 +439,7 @@ class OpDispatcher(TorchOpDispatcher):
                 assert isinstance(output_spec, DTensorSpec)
                 assert isinstance(args[0], dtensor.DTensor)
                 args[0]._spec = output_spec
-                if op_call._schema._is_view_op():
+                if op_info.schema.is_view_op():
                     return return_and_correct_aliasing(op_call, args, kwargs, args[0])
                 return args[0]
             return None
@@ -383,7 +462,7 @@ class OpDispatcher(TorchOpDispatcher):
             return tuple(out_dts) if len(out_dts) > 1 else out_dts[0]
 
         ret = self.wrap(local_results, output_sharding.output_spec)
-        if participating and op_call._schema._is_view_op():
+        if participating and op_info.schema.is_view_op():
             return return_and_correct_aliasing(op_call, args, kwargs, ret)
         return ret
 

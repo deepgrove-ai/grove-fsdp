@@ -67,7 +67,8 @@ class ShardingPropagator(TorchShardingPropagator):
                 output_spec,
                 output_tensor_meta,
             )
-        return super()._wrap_output_spec_tensor_meta(op, output_spec, output_tensor_meta)
+        super()._wrap_output_spec_tensor_meta(op, output_spec, output_tensor_meta)
+        return output_spec
 
     def propagate_op_sharding_non_cached(self, op_schema: OpSchema) -> OutputSharding:
         """
