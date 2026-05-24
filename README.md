@@ -54,6 +54,7 @@ optimizer = fully_shard_optimizer(optimizer)
 - `RaggedShard`
 - `DistributedBuffer`
 - `DBufferPlan`
+- `plan_dbuffer_layout`
 
 ## Notes
 

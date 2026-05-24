@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .dbuffer import DBufferPlan, DistributedBuffer, RaggedShard, get_ragged_shard, is_ragged_shard
+from .dbuffer import (
+    DBufferPlan,
+    DistributedBuffer,
+    RaggedShard,
+    get_ragged_shard,
+    is_ragged_shard,
+    plan_dbuffer_layout,
+)
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .fully_shard import fully_shard, fully_shard_model, fully_shard_optimizer
 from .grove_fsdp import GroveFSDP
@@ -40,6 +47,7 @@ __all__ = [
     "RaggedShard",
     "get_ragged_shard",
     "is_ragged_shard",
+    "plan_dbuffer_layout",
     "FSDPDistributedIndex",
     "MixedPrecisionPolicy",
     "fully_shard",

@@ -422,60 +422,6 @@ def _default_item_block_size(shape: torch.Size, requested_block_size: Optional[i
     return max(1, shape[1:].numel())
 
 
-def _first_fit_decreasing_pack(
-    items: List[Tuple[int, torch.Size, int]], shard_quantum: int
-) -> Dict[int, int]:
-    """Pack items into offsets while preserving each item's block alignment.
-
-    This is the practical heuristic used here for the veScale-style planning
-    problem: process larger, more constrained items first, place each item at
-    the earliest offset that respects its block granularity, and allow smaller
-    tensors to fill alignment gaps left by larger tensors.
-    """
-
-    planned: Dict[int, int] = {}
-    free_gaps: List[Tuple[int, int]] = []
-    tail = 0
-
-    def aligned(offset: int, block_size: int) -> int:
-        return _pad(offset, math.gcd(block_size, shard_quantum))
-
-    sorted_items = sorted(items, key=lambda item: (-item[1].numel(), -item[2], item[0]))
-    for item_id, shape, block_size in sorted_items:
-        size = shape.numel()
-        gap_index_to_remove = None
-        chosen_offset = None
-        chosen_gap_suffix = None
-
-        for gap_index, (gap_start, gap_size) in enumerate(free_gaps):
-            offset = aligned(gap_start, block_size)
-            leading = offset - gap_start
-            if leading + size <= gap_size:
-                chosen_offset = offset
-                gap_index_to_remove = gap_index
-                suffix_start = offset + size
-                suffix_size = gap_start + gap_size - suffix_start
-                chosen_gap_suffix = (suffix_start, suffix_size)
-                if leading > 0:
-                    free_gaps.append((gap_start, leading))
-                break
-
-        if chosen_offset is not None:
-            planned[item_id] = chosen_offset
-            free_gaps.pop(gap_index_to_remove)
-            if chosen_gap_suffix is not None and chosen_gap_suffix[1] > 0:
-                free_gaps.append(chosen_gap_suffix)
-            continue
-
-        offset = aligned(tail, block_size)
-        if offset > tail:
-            free_gaps.append((tail, offset - tail))
-        planned[item_id] = offset
-        tail = offset + size
-
-    return planned
-
-
 def _compact_in_original_order(
     items: List[Tuple[int, torch.Size, int]],
     shard_quantum: int,
@@ -490,6 +436,156 @@ def _compact_in_original_order(
         planned[item_id] = offset
         offset += shape.numel()
     return planned
+
+
+def _validate_planner_items(items: List[Tuple[int, torch.Size, int]]) -> None:
+    for item_id, shape, block_size in items:
+        size = shape.numel()
+        if block_size <= 0:
+            raise ValueError(f"RaggedShard block size must be positive for item {item_id}")
+        if size % block_size != 0:
+            raise ValueError(
+                f"RaggedShard item {item_id} has {size} elements, which is not divisible "
+                f"by block size {block_size}"
+            )
+
+
+def _tensor_boundary_is_valid(start: int, size: int, block_size: int, shard_size: int) -> bool:
+    """Return true if shard boundaries crossing a tensor preserve whole blocks."""
+    end = start + size
+    boundary = ((start // shard_size) + 1) * shard_size
+    while boundary < end:
+        if (boundary - start) % block_size != 0:
+            return False
+        boundary += shard_size
+    return True
+
+
+def _next_valid_tensor_start(
+    cursor: int,
+    size: int,
+    block_size: int,
+    shard_size: int,
+    num_devices: int,
+) -> Optional[int]:
+    """Find the earliest start >= cursor satisfying Algorithm 1's constraints."""
+    total_size = shard_size * num_devices
+    if cursor + size > total_size:
+        return None
+
+    first_shard = cursor // shard_size
+    for shard_idx in range(first_shard, num_devices):
+        shard_start = shard_idx * shard_size
+        shard_end = shard_start + shard_size
+        base = max(cursor, shard_start)
+
+        # Case 1 from the paper: the tensor lies entirely within a local shard.
+        if base + size <= shard_end:
+            return base
+
+        if shard_end >= total_size:
+            break
+
+        # Cases 2/3: the tensor crosses this shard boundary. The boundary must
+        # land on a tensor block boundary, i.e. start == shard_end (mod block).
+        lower = max(base, shard_end - size + 1)
+        upper = shard_end - 1
+        start = lower + ((shard_end - lower) % block_size)
+        if start <= upper and _tensor_boundary_is_valid(
+            start, size, block_size, shard_size
+        ):
+            return start
+
+    return None
+
+
+def _check_valid_shard_size(
+    ordered_items: List[Tuple[int, torch.Size, int]],
+    shard_size: int,
+    num_devices: int,
+) -> Optional[Dict[int, int]]:
+    """Check a candidate per-device buffer size and return offsets if feasible."""
+    cursor = 0
+    offsets: Dict[int, int] = {}
+    for item_id, shape, block_size in ordered_items:
+        start = _next_valid_tensor_start(
+            cursor,
+            shape.numel(),
+            block_size,
+            shard_size,
+            num_devices,
+        )
+        if start is None:
+            return None
+        offsets[item_id] = start
+        cursor = start + shape.numel()
+    return offsets
+
+
+def _minimal_feasible_shard_layout(
+    ordered_items: List[Tuple[int, torch.Size, int]],
+    num_devices: int,
+    alignment: int,
+) -> Tuple[int, Dict[int, int]]:
+    """Binary-search the smallest feasible shard size for a fixed alignment."""
+    total_size = sum(shape.numel() for _, shape, _ in ordered_items)
+    lower_k = max(1, math.ceil(math.ceil(total_size / num_devices) / alignment))
+    high_k = lower_k
+    offsets = None
+
+    while offsets is None:
+        offsets = _check_valid_shard_size(ordered_items, high_k * alignment, num_devices)
+        if offsets is None:
+            high_k *= 2
+
+    low_k = lower_k
+    best_k = high_k
+    best_offsets = offsets
+    while low_k <= high_k:
+        mid_k = (low_k + high_k) // 2
+        offsets = _check_valid_shard_size(ordered_items, mid_k * alignment, num_devices)
+        if offsets is not None:
+            best_k = mid_k
+            best_offsets = offsets
+            high_k = mid_k - 1
+        else:
+            low_k = mid_k + 1
+
+    return best_k * alignment, best_offsets
+
+
+def _algorithm1_plan_offsets(
+    ordered_items: List[Tuple[int, torch.Size, int]],
+    num_devices: int,
+    collective_unit_size: int,
+) -> Tuple[int, Dict[int, int]]:
+    """Plan offsets using veScale-FSDP Algorithm 1 for the given tensor order.
+
+    The paper fixes an ordered tensor list and searches over least-common-multiple
+    alignments of the collective unit and per-tensor RaggedShard block sizes. For
+    each alignment, ``CheckValidShard`` determines whether all tensors can fit in
+    ``num_devices`` uniform local shards while preserving non-shardable blocks.
+    """
+    if not ordered_items:
+        return 0, {}
+
+    _validate_planner_items(ordered_items)
+    alignment = max(1, collective_unit_size)
+    best_shard_size = math.inf
+    best_offsets: Dict[int, int] = {}
+
+    for block_size in sorted({block_size for _, _, block_size in ordered_items}):
+        alignment = math.lcm(alignment, block_size)
+        shard_size, offsets = _minimal_feasible_shard_layout(
+            ordered_items,
+            num_devices,
+            alignment,
+        )
+        if shard_size < best_shard_size:
+            best_shard_size = shard_size
+            best_offsets = offsets
+
+    return int(best_shard_size), best_offsets
 
 
 def plan_dbuffer_layout(
@@ -514,13 +610,15 @@ def plan_dbuffer_layout(
         chunk_size_factor: Existing Grove-FSDP communication segmentation unit.
         pad_bucket: Whether the bucket must be padded to shard evenly.
         item_block_size_fn: Optional per-shape block-size override.
-        preserve_item_order: If true, disables gap-filling reordering.
+        preserve_item_order: If true, keeps the legacy compact-in-order layout
+            instead of running the RaggedShard planner.
 
     Returns:
         A DBufferPlan that can be translated into the existing bucket index types.
     """
 
-    shard_quantum = data_parallel_world_size * max(1, chunk_size_factor)
+    collective_unit_size = max(1, chunk_size_factor)
+    shard_quantum = data_parallel_world_size * collective_unit_size
     item_block_size_fn = item_block_size_fn or (
         lambda shape: _default_item_block_size(shape, chunk_size_factor)
     )
@@ -531,8 +629,23 @@ def plan_dbuffer_layout(
 
     if preserve_item_order:
         offsets = _compact_in_original_order(items, shard_quantum)
+        end_offset = max(
+            (offsets[item_id] + shape.numel() for item_id, shape, _ in items),
+            default=0,
+        )
+        bucket_size = _pad(end_offset, shard_quantum) if pad_bucket else end_offset
     else:
-        offsets = _first_fit_decreasing_pack(items, shard_quantum)
+        shard_size, offsets = _algorithm1_plan_offsets(
+            items,
+            num_devices=data_parallel_world_size,
+            collective_unit_size=collective_unit_size,
+        )
+        bucket_size = shard_size * data_parallel_world_size
+        if not pad_bucket:
+            bucket_size = max(
+                (offsets[item_id] + shape.numel() for item_id, shape, _ in items),
+                default=0,
+            )
 
     planned_items = tuple(
         DBufferItem(
@@ -544,8 +657,6 @@ def plan_dbuffer_layout(
         )
         for item_id, shape, block_size in sorted(items, key=lambda item: item[0])
     )
-    end_offset = max((item.global_data_index + item.size for item in planned_items), default=0)
-    bucket_size = _pad(end_offset, shard_quantum) if pad_bucket else end_offset
 
     shard_size = bucket_size // data_parallel_world_size
     bucket_data_index = shard_size * data_parallel_rank
