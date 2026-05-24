@@ -1,0 +1,72 @@
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+
+[build-system]
+requires = ["setuptools>=80", "pybind11"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["grove_fsdp", "grove_fsdp.*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "grove_fsdp.package_info.__version__" }
+readme = { file = "README.md", content-type = "text/markdown" }
+
+[project]
+name = "grove-fsdp"
+dynamic = ["version", "readme"]
+description = "Standalone PyTorch FSDP package with zero-copy buffers and RaggedShard planning"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["torch>=2.9.1", "einops", "packaging"]
+authors = [{ name = "Grove-FSDP maintainers" }]
+maintainers = [{ name = "Grove-FSDP maintainers" }]
+keywords = [
+    "NLP",
+    "NLU",
+    "deep",
+    "gpu",
+    "language",
+    "learning",
+    "machine",
+    "nvidia",
+    "pytorch",
+    "torch",
+    "transformer",
+    "fsdp",
+    "ragged-shard",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Utilities",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+
+[tool.uv]
+
+[tool.uv.sources]
