@@ -567,6 +567,7 @@ class FSDPDistributedIndex:
         # combination of the outer-FSDP and FSDP process groups.
         self.hybrid_fsdp_group = hybrid_fsdp_group
         self.hybrid_fsdp_expt_group = hybrid_fsdp_expt_group
+        self.has_expert_parallel_mesh = self.expt_device_mesh is not None
 
         # Retrieve the expert parallel process groups from the DeviceMesh.
         self.expt_fsdp_group = (
@@ -582,6 +583,13 @@ class FSDPDistributedIndex:
             and contains_submesh(self.expt_device_mesh, self.dp_outer_dim)
             else None
         )
+
+        if not self.has_expert_parallel_mesh:
+            self.expt_device_mesh = self.device_mesh
+            self.expt_fsdp_group = self.fsdp_group
+            self.expt_fsdp_group_ag = self.fsdp_group_ag
+            self.expt_outer_fsdp_group = self.outer_fsdp_group
+            self.hybrid_fsdp_expt_group = self.hybrid_fsdp_group
 
         """
         Megatron-FSDP is responsible for storing all required DeviceMesh
@@ -616,7 +624,8 @@ class FSDPDistributedIndex:
         register_submesh(self.device_mesh, hsdp_submesh, False)
         register_submesh(self.device_mesh, fsdp_submesh, False)
 
-        # Register EP submeshes
+        # Register EP submeshes. If no explicit expert mesh was provided,
+        # expert-named parameters use the regular FSDP topology.
         if self.expt_device_mesh is not None:
             register_submesh(self.device_mesh, hsdp_submesh, True)
             register_submesh(self.device_mesh, hsdp_tp_submesh, True)
